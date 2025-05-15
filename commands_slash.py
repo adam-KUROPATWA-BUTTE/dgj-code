@@ -100,14 +100,14 @@ def setup_commands(bot: commands.Bot):
             await interaction.response.send_message("Tu dois être dans un canal vocal.")
 
     @bot.tree.command(name="play", description="Jouer une musique")
-    @app_commands.describe(url="Lien vers la vidéo YouTube")
-    async def play(interaction: discord.Interaction, url: str):
-        await interaction.response.defer()  # ✅ Appelé dès le début
+@app_commands.describe(url="Lien YouTube")
+async def play(interaction: discord.Interaction, url: str):
+    # Répond d'abord (ACK rapide à Discord)
+    await interaction.response.defer()
 
-        guild_id = interaction.guild.id
-        if guild_id not in queues:
-            queues[guild_id] = []
-
+    try:
+        # logique...
+        # Connecte si nécessaire
         if not interaction.guild.voice_client:
             if interaction.user.voice:
                 await interaction.user.voice.channel.connect()
@@ -115,19 +115,19 @@ def setup_commands(bot: commands.Bot):
                 await interaction.followup.send("❗ Tu dois être dans un canal vocal.")
                 return
 
-        vc = interaction.guild.voice_client
-        queues[guild_id].append(url)
+        # Ajout à la queue
+        guild_id = interaction.guild.id
+        queues.setdefault(guild_id, []).append(url)
 
-        try:
-            if not vc.is_playing() and not vc.is_paused():
-                await play_next(interaction.guild, bot)
-                await interaction.followup.send(
-                    f"🎵 Lecture commencée avec : {url}", view=MusicControls(interaction.guild)
-                )
-            else:
-                await interaction.followup.send(f"🔗 Ajouté à la queue : {url}")
-        except Exception as e:
-            await interaction.followup.send(str(e))
+        vc = interaction.guild.voice_client
+        if not vc.is_playing() and not vc.is_paused():
+            await play_next(interaction.guild, bot)
+            await interaction.followup.send(f"🎵 Lecture commencée avec : {url}", view=MusicControls(interaction.guild))
+        else:
+            await interaction.followup.send(f"🔗 Ajouté à la queue : {url}")
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Erreur : {str(e)}")
 
     @bot.tree.command(name="queue", description="Afficher la file d'attente")
     async def queue(interaction: discord.Interaction):
