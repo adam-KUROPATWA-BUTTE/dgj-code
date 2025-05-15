@@ -7,7 +7,7 @@ from typing import Dict, List
 import os
 from dotenv import load_dotenv
 
-# 🔐 Charger le token et ID du propriétaire depuis .env
+# 🔐 Charger les variables depuis .env
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
@@ -44,9 +44,14 @@ class YTDLSource(discord.PCMVolumeTransformer):
     @classmethod
     async def from_url(cls, url, *, loop=None, stream=True):
         loop = loop or asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+        try:
+            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+        except Exception:
+            raise Exception("❌ Impossible de lire cette vidéo (indisponible, supprimée ou bloquée).")
+
         if "entries" in data:
             data = data["entries"][0]
+
         filename = data["url"] if stream else ytdl.prepare_filename(data)
         return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
 
@@ -54,7 +59,14 @@ async def play_next(guild: discord.Guild):
     vc = guild.voice_client
     if guild.id in queues and queues[guild.id]:
         next_url = queues[guild.id].pop(0)
-        player = await YTDLSource.from_url(next_url, loop=bot.loop, stream=True)
+        try:
+            player = await YTDLSource.from_url(next_url, loop=bot.loop, stream=True)
+        except Exception as e:
+            print(f"Erreur lecture suivante : {e}")
+            await asyncio.sleep(2)
+            if vc.is_connected():
+                await vc.disconnect()
+            return
 
         def after_playing(error):
             fut = asyncio.run_coroutine_threadsafe(play_next(guild), bot.loop)
@@ -62,9 +74,9 @@ async def play_next(guild: discord.Guild):
                 fut.result()
             except:
                 pass
+
         vc.play(player, after=after_playing)
     else:
-        # 🕳️ Auto-leave quand la file est vide
         await asyncio.sleep(2)
         if vc.is_connected():
             await vc.disconnect()
@@ -118,7 +130,7 @@ async def join(interaction: discord.Interaction):
 @bot.tree.command(name="play", description="Jouer une musique")
 @app_commands.describe(url="Lien vers la vidéo YouTube")
 async def play(interaction: discord.Interaction, url: str):
-    await interaction.response.defer()
+    await interaction.response.defer()  # ⚠️ dès la première ligne
 
     guild_id = interaction.guild.id
     if guild_id not in queues:
@@ -134,13 +146,16 @@ async def play(interaction: discord.Interaction, url: str):
     vc = interaction.guild.voice_client
     queues[guild_id].append(url)
 
-    if not vc.is_playing() and not vc.is_paused():
-        await play_next(interaction.guild)
-        await interaction.followup.send(
-            f"🎵 Lecture commencée avec : {url}", view=MusicControls(interaction.guild)
-        )
-    else:
-        await interaction.followup.send(f"🔗 Ajouté à la queue : {url}")
+    try:
+        if not vc.is_playing() and not vc.is_paused():
+            await play_next(interaction.guild)
+            await interaction.followup.send(
+                f"🎵 Lecture commencée avec : {url}", view=MusicControls(interaction.guild)
+            )
+        else:
+            await interaction.followup.send(f"🔗 Ajouté à la queue : {url}")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Erreur : {str(e)}")
 
 @bot.tree.command(name="queue", description="Afficher la file d'attente")
 async def queue(interaction: discord.Interaction):
@@ -161,13 +176,13 @@ async def leave(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("Je ne suis pas connecté à un canal vocal.")
 
-# 🔌 Commande secrète pour arrêter le bot (owner only)
+# 🔌 Commande secrète pour éteindre le bot
 @bot.command(name="arretetoi", hidden=True)
-async def shutdown(ctx):
+async def arretetoi(ctx):
     if ctx.author.id == OWNER_ID:
-        await ctx.send("🔌 Extinction en cours...")
+        await ctx.send("🔌 Extinction...")
         await bot.close()
     else:
-        await ctx.send("❌ Tu n'as pas la permission pour faire ça.")
+        await ctx.send("❌ Tu n'as pas la permission pour ça.")
 
 bot.run(TOKEN)
