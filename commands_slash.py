@@ -1,12 +1,12 @@
 import discord
-from discord import app_commands
 from discord.ext import commands
+from discord import app_commands
 import yt_dlp as youtube_dl
 import asyncio
 from typing import Dict, List
 
 ytdl_format_options = {
-    "format": "251/bestaudio",
+    "format": "251/bestaudio",  # Opus 160 kbps
     "quiet": True,
     "no_warnings": True,
     "default_search": "auto",
@@ -20,7 +20,6 @@ ffmpeg_options = {
 }
 
 ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
-
 queues: Dict[int, List[str]] = {}
 
 class YTDLSource(discord.PCMVolumeTransformer):
@@ -35,7 +34,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
         try:
             data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
         except Exception:
-            raise Exception("❌ Impossible de lire cette vidéo (peut-être privée, supprimée ou bloquée).")
+            raise Exception("❌ Cette vidéo n'est pas disponible (privée, supprimée ou bloquée).")
 
         if "entries" in data:
             data = data["entries"][0]
@@ -50,7 +49,8 @@ async def play_next(guild: discord.Guild, bot: commands.Bot):
         try:
             player = await YTDLSource.from_url(next_url, loop=bot.loop, stream=True)
         except Exception as e:
-            print(e)
+            print(f"Erreur lecture suivante : {e}")
+            # Optionnel : prévenir dans un salon textuel ici
             return
 
         def after_playing(error):
@@ -100,14 +100,14 @@ def setup_commands(bot: commands.Bot):
             await interaction.response.send_message("Tu dois être dans un canal vocal.")
 
     @bot.tree.command(name="play", description="Jouer une musique")
-@app_commands.describe(url="Lien YouTube")
-async def play(interaction: discord.Interaction, url: str):
-    # Répond d'abord (ACK rapide à Discord)
-    await interaction.response.defer()
+    @app_commands.describe(url="Lien vers la vidéo YouTube")
+    async def play(interaction: discord.Interaction, url: str):
+        await interaction.response.defer()
 
-    try:
-        # logique...
-        # Connecte si nécessaire
+        guild_id = interaction.guild.id
+        if guild_id not in queues:
+            queues[guild_id] = []
+
         if not interaction.guild.voice_client:
             if interaction.user.voice:
                 await interaction.user.voice.channel.connect()
@@ -115,19 +115,19 @@ async def play(interaction: discord.Interaction, url: str):
                 await interaction.followup.send("❗ Tu dois être dans un canal vocal.")
                 return
 
-        # Ajout à la queue
-        guild_id = interaction.guild.id
-        queues.setdefault(guild_id, []).append(url)
-
         vc = interaction.guild.voice_client
-        if not vc.is_playing() and not vc.is_paused():
-            await play_next(interaction.guild, bot)
-            await interaction.followup.send(f"🎵 Lecture commencée avec : {url}", view=MusicControls(interaction.guild))
-        else:
-            await interaction.followup.send(f"🔗 Ajouté à la queue : {url}")
+        queues[guild_id].append(url)
 
-    except Exception as e:
-        await interaction.followup.send(f"❌ Erreur : {str(e)}")
+        try:
+            if not vc.is_playing() and not vc.is_paused():
+                await play_next(interaction.guild, bot)
+                await interaction.followup.send(
+                    f"🎵 Lecture commencée avec : {url}", view=MusicControls(interaction.guild)
+                )
+            else:
+                await interaction.followup.send(f"🔗 Ajouté à la queue : {url}")
+        except Exception as e:
+            await interaction.followup.send(str(e))
 
     @bot.tree.command(name="queue", description="Afficher la file d'attente")
     async def queue(interaction: discord.Interaction):
