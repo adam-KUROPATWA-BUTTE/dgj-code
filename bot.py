@@ -133,6 +133,55 @@ def is_suspicious_account(member):
     
     return False, None
 
+#########################
+# /message sepration
+#########################
+def split_long_message(message, max_length=4000):
+    """Divise un long message en plusieurs parties intelligemment"""
+    
+    if len(message) <= max_length:
+        return [message]
+    
+    parts = []
+    
+    # Séparateurs prioritaires pour couper intelligemment
+    separators = [
+        '\n---\n',  # Séparateurs de section
+        '\n## ',    # Titres de niveau 2
+        '\n### ',   # Titres de niveau 3
+        '\n\n',     # Paragraphes
+        '\n',       # Lignes
+        '. ',       # Phrases
+        ' '         # Mots
+    ]
+    
+    remaining = message
+    
+    while len(remaining) > max_length:
+        # Trouver le meilleur endroit pour couper
+        best_cut = max_length
+        
+        for separator in separators:
+            # Chercher le dernier séparateur avant la limite
+            last_sep = remaining.rfind(separator, 0, max_length)
+            if last_sep > max_length * 0.5:  # Au moins 50% de la limite
+                best_cut = last_sep + len(separator)
+                break
+        
+        # Extraire la partie
+        part = remaining[:best_cut].strip()
+        if part:
+            parts.append(part)
+        
+        # Continuer avec le reste
+        remaining = remaining[best_cut:].strip()
+    
+    # Ajouter la dernière partie
+    if remaining:
+        parts.append(remaining)
+    
+    return parts
+
 async def log_action(guild, action_type, moderator, target, reason, duration=None):
     """Log une action de modération"""
     config = get_security_config(guild.id)
@@ -883,22 +932,29 @@ def create_embed(title, description, color=0x00ff00):
 
 @bot.event
 async def on_ready():
+    print(f"🤖 {bot.user} est connecté et prêt !")
+    print(f"🏠 Serveurs: {len(bot.guilds)}")
+    
     try:
-        print("🔄 Synchronisation FORCÉE des commandes...")
+        # Sync global
+        print("🌍 Synchronisation globale...")
+        synced_global = await bot.tree.sync()
+        print(f"✅ Global: {len(synced_global)} commandes")
         
-        # Synchronisation simple sans clear_commands()
-        synced = await bot.tree.sync()
+        # Sync pour chaque serveur individuellement
+        for guild in bot.guilds:
+            try:
+                print(f"🏠 Sync pour {guild.name}...")
+                synced_guild = await bot.tree.sync(guild=guild)
+                print(f"✅ {guild.name}: {len(synced_guild)} commandes")
+            except Exception as e:
+                print(f"❌ {guild.name}: {e}")
         
-        logger.info(f"🔄 {len(synced)} slash command(s) synchronisée(s) avec FORCE")
-        
-        # Lister toutes les commandes synchronisées
-        print("📋 Commandes disponibles :")
-        for cmd in synced:
-            print(f"  ✅ /{cmd.name} - {cmd.description}")
+        print("🔄 Synchronisation complète terminée !")
         
     except Exception as e:
-        logger.error(f"❌ Erreur synchronisation: {e}")
-    
+        print(f"❌ Erreur sync: {e}")
+
     # Initialiser Spotify
     init_spotify()
     
@@ -917,7 +973,7 @@ async def on_ready():
     
     await bot.change_presence(
         status=discord.Status.online,
-        activity=discord.Activity(type=discord.ActivityType.watching, name="/help - Musique + Modération + Salons vocaux !")
+        activity=discord.Activity(type=discord.ActivityType.watching, name="Bot De Mada - /help pour plus d'infos")
     )
     
     print("=" * 80)
@@ -1417,7 +1473,7 @@ async def timeout_user(interaction: discord.Interaction, user: discord.Member, d
     duration = max(1, min(1440, duration))  # Entre 1 minute et 24 heures
     
     try:
-                timeout_until = datetime.now() + timedelta(minutes=duration)
+        timeout_until = datetime.now() + timedelta(minutes=duration)
         await user.timeout(timeout_until, reason=reason)
         
         embed = create_embed("⏰ Utilisateur en timeout", f"**{user.display_name}** a été mis en timeout", 0xffa726)
@@ -1496,7 +1552,7 @@ async def warn_user(interaction: discord.Interaction, user: discord.Member, reas
 @bot.tree.command(name="clear", description="🧹 Supprimer des messages")
 @app_commands.describe(
     amount="Nombre de messages à supprimer (1-100)",
-    user="Supprimer seulement les messages de cet utilisateur (optionnel)"
+    user="Utilisateur spécifique (optionnel)"
 )
 async def clear_messages(interaction: discord.Interaction, amount: int, user: discord.Member = None):
     """Supprimer des messages"""
@@ -1505,39 +1561,122 @@ async def clear_messages(interaction: discord.Interaction, amount: int, user: di
         await interaction.response.send_message("❌ Vous devez être administrateur !", ephemeral=True)
         return
     
-    amount = max(1, min(100, amount))
+    if amount < 1 or amount > 100:
+        await interaction.response.send_message("❌ Le nombre doit être entre 1 et 100 !", ephemeral=True)
+        return
+    
+    # 🔥 DÉFÉRER IMMÉDIATEMENT (< 3 secondes)
+    await interaction.response.defer(ephemeral=True)
     
     try:
+        deleted = []
+        
         if user:
-            # Supprimer les messages d'un utilisateur spécifique
+            # Supprimer messages d'un utilisateur spécifique
             def check(message):
                 return message.author == user
-            
-            deleted = await interaction.channel.purge(limit=amount*2, check=check)
-            deleted_count = len(deleted)
-            
-            embed = create_embed("🧹 Messages supprimés", f"**{deleted_count}** messages de **{user.display_name}** ont été supprimés", 0x66bb6a)
+            deleted = await interaction.channel.purge(limit=amount, check=check)
         else:
-            # Supprimer les derniers messages
+            # Supprimer les X derniers messages
             deleted = await interaction.channel.purge(limit=amount)
-            deleted_count = len(deleted)
-            
-            embed = create_embed("🧹 Messages supprimés", f"**{deleted_count}** messages ont été supprimés", 0x66bb6a)
         
+        # Créer l'embed de confirmation
+        embed = create_embed(
+            "🧹 Messages supprimés", 
+            f"**{len(deleted)} messages** supprimés avec succès !", 
+            0x66bb6a
+        )
         embed.add_field(name="👮 Modérateur", value=interaction.user.mention, inline=True)
-        embed.add_field(name="📍 Channel", value=interaction.channel.mention, inline=True)
+        embed.add_field(name="📍 Canal", value=interaction.channel.mention, inline=True)
+        if user:
+            embed.add_field(name="👤 Utilisateur ciblé", value=user.mention, inline=True)
         
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        # 🔥 UTILISER FOLLOWUP AU LIEU DE RESPONSE
+        await interaction.followup.send(embed=embed, ephemeral=True)
         
         # Log l'action
-        target_info = f"de {user.display_name}" if user else "génériques"
-        await log_action(interaction.guild, "clear", interaction.user, user or interaction.guild.me, f"{deleted_count} messages {target_info}")
+        target_info = f" de {user.display_name}" if user else ""
+        await log_action(
+            interaction.guild, 
+            "clear", 
+            interaction.user, 
+            user or interaction.guild.me, 
+            f"{len(deleted)} messages supprimés{target_info} dans {interaction.channel.name}"
+        )
         
-        logger.info(f"🧹 {interaction.user} a supprimé {deleted_count} messages dans {interaction.channel}")
+        logger.info(f"🧹 {interaction.user} a supprimé {len(deleted)} messages{target_info} dans {interaction.channel.name}")
+        
+    except discord.Forbidden:
+        embed = create_embed("❌ Erreur de permissions", "Je n'ai pas les permissions pour supprimer les messages ici.", 0xff0000)
+        await interaction.followup.send(embed=embed, ephemeral=True)
         
     except Exception as e:
-        embed = create_embed("❌ Erreur", f"Impossible de supprimer les messages: {str(e)}", 0xff0000)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        embed = create_embed("❌ Erreur", f"Une erreur est survenue: {str(e)}", 0xff0000)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        logger.error(f"❌ Erreur clear: {e}")
+
+
+@bot.tree.command(name="message", description="📢 Envoyer un message en tant que bot")
+@app_commands.describe(
+    message="Le message à envoyer",
+    channel="Canal où envoyer le message (optionnel)"
+)
+async def send_message_as_bot(interaction: discord.Interaction, message: str, channel: discord.TextChannel = None):
+    """Envoyer un message en tant que bot avec division automatique"""
+    
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ Vous devez être administrateur !", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    # Utiliser le canal actuel si aucun canal spécifié
+    target_channel = channel or interaction.channel
+    
+    try:
+        # Diviser le message en parties si nécessaire
+        message_parts = split_long_message(message)
+        
+        # Envoyer chaque partie
+        for i, part in enumerate(message_parts, 1):
+            embed = create_embed("📢 Message du Bot", part, 0x5865f2)
+            
+            # Ajouter les infos seulement sur le premier embed
+            if i == 1:
+                embed.add_field(name="👮 Envoyé par", value=interaction.user.mention, inline=True)
+                embed.add_field(name="📍 Canal", value=target_channel.mention, inline=True)
+            
+            # Footer avec numérotation si plusieurs parties
+            if len(message_parts) > 1:
+                embed.set_footer(text=f"Partie {i}/{len(message_parts)} • {datetime.now().strftime('%d/%m/%Y à %H:%M')}")
+            else:
+                embed.set_footer(text=f"Message envoyé le {datetime.now().strftime('%d/%m/%Y à %H:%M')}")
+            
+            await target_channel.send(embed=embed)
+            
+            # Petite pause entre les embeds pour éviter le rate limit
+            if i < len(message_parts):
+                await asyncio.sleep(0.5)
+        
+        # Confirmation à l'utilisateur
+        if target_channel != interaction.channel:
+            parts_text = f" en {len(message_parts)} partie(s)" if len(message_parts) > 1 else ""
+            confirmation = create_embed("✅ Message envoyé", f"Message envoyé dans {target_channel.mention}{parts_text}", 0x66bb6a)
+            await interaction.followup.send(embed=confirmation, ephemeral=True)
+        else:
+            parts_text = f" en {len(message_parts)} partie(s)" if len(message_parts) > 1 else ""
+            await interaction.followup.send(f"✅ Message envoyé{parts_text} !", ephemeral=True)
+        
+        # Log l'action
+        parts_info = f" ({len(message_parts)} parties)" if len(message_parts) > 1 else ""
+        await log_action(interaction.guild, "message", interaction.user, interaction.guild.me, f"Message envoyé dans {target_channel.name}{parts_info}")
+        
+        logger.info(f"📢 {interaction.user} a envoyé un message bot dans {target_channel.name}: {len(message_parts)} partie(s)")
+        
+    except Exception as e:
+        embed = create_embed("❌ Erreur", f"Impossible d'envoyer le message: {str(e)}", 0xff0000)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
 
 @bot.tree.command(name="warns", description="📋 Voir les avertissements d'un utilisateur")
 @app_commands.describe(user="Utilisateur à vérifier")
@@ -1677,6 +1816,21 @@ async def security_status(interaction: discord.Interaction):
     timeout_min = config["timeout_duration"] // 60
     embed.add_field(name="⏰ Timeout auto", value=f"{timeout_min} min", inline=True)
     
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="set_log_channel", description="📝 Définir le salon de logs")
+@app_commands.describe(channel="Salon où envoyer les logs de modération")
+async def set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    """Définir le salon de logs"""
+    
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ Vous devez être administrateur !", ephemeral=True)
+        return
+    
+    config = get_security_config(interaction.guild_id)
+    config["log_channel_id"] = channel.id
+    
+    embed = create_embed("📝 Salon de logs configuré", f"Les logs seront envoyés dans {channel.mention}")
     await interaction.response.send_message(embed=embed)
 
 # ============================
@@ -1944,7 +2098,7 @@ async def help_command(interaction: discord.Interaction):
             "`/stats` - Statistiques d'extraction\n"
             "`/help` - Cette aide\n\n"
             f"**Version :** 2025-07-01 avec Anti-Raid\n"
-            f"**Développeur :** adam-KUROPATWA-BUTTE\n"
+            f"**Développeur :** Mada\n"
             f"**Serveurs :** {len(bot.guilds)}"
         ),
         inline=False
@@ -2038,7 +2192,7 @@ async def debug_command(interaction: discord.Interaction):
     
     embed.add_field(name="📋 Commandes synchronisées", value=f"{len(commands_list)} commandes", inline=True)
     embed.add_field(name="🏠 Serveurs", value=str(len(bot.guilds)), inline=True)
-    embed.add_field(name="👤 Développeur", value="adam-KUROPATWA-BUTTE", inline=True)
+    embed.add_field(name="👤 Développeur", value="Mada", inline=True)
     
     embed.add_field(name="📊 Stats extraction", value=f"Succès: {EXTRACTION_STATS['success']}\nÉchecs: {EXTRACTION_STATS['failed']}", inline=True)
     embed.add_field(name="🛡️ Sécurité active", value=str(len(SECURITY_CONFIG)), inline=True)
@@ -2050,6 +2204,47 @@ async def debug_command(interaction: discord.Interaction):
     embed.add_field(name="🎯 Intents", value="✅ Tous configurés", inline=True)
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="sync", description="🔄 [OWNER] Forcer la synchronisation des commandes")
+async def force_sync(interaction: discord.Interaction):
+    """Forcer la synchronisation des commandes slash"""
+    
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ Réservé au propriétaire du bot !", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        # Synchronisation forcée
+        synced = await bot.tree.sync()
+        
+        embed = create_embed("🔄 Synchronisation Forcée", f"**{len(synced)} commandes** synchronisées avec succès !", 0x66bb6a)
+        
+        # Lister les commandes synchronisées
+        commands_list = []
+        for cmd in synced:
+            commands_list.append(f"• `/{cmd.name}` - {cmd.description[:50]}{'...' if len(cmd.description) > 50 else ''}")
+        
+        # Diviser en chunks si trop de commandes
+        if len(commands_list) <= 10:
+            embed.add_field(name="📋 Commandes synchronisées", value="\n".join(commands_list), inline=False)
+        else:
+            embed.add_field(name="📋 Premières commandes", value="\n".join(commands_list[:10]), inline=False)
+            embed.add_field(name="➕ Et plus...", value=f"{len(commands_list) - 10} autres commandes", inline=False)
+        
+        embed.add_field(name="⏰ Synchronisé le", value=f"<t:{int(datetime.now().timestamp())}:F>", inline=False)
+        embed.add_field(name="💡 Info", value="Les commandes peuvent prendre jusqu'à 1 heure pour apparaître sur tous les serveurs.", inline=False)
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+        logger.info(f"🔄 {interaction.user} a forcé la synchronisation: {len(synced)} commandes")
+        
+    except Exception as e:
+        embed = create_embed("❌ Erreur Synchronisation", f"Erreur lors de la synchronisation:\n```{str(e)}```", 0xff0000)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        logger.error(f"❌ Erreur sync forcée: {e}")
 
 # ============================
 # LANCEMENT
@@ -2065,7 +2260,7 @@ if __name__ == "__main__":
     print("🎤 Salons temporaires: Création automatique personnalisée")
     print("📻 Fallback: Radio garantie si extraction échoue")
     print("🎵 Queue: Gestion intelligente avec retry automatique")
-    print("👤 Développé pour: adam-KUROPATWA-BUTTE")
+    print("👤 Développé pour: Mada")
     print("📅 Version: 2025-07-01 14:15:21 UTC - ÉDITION COMPLÈTE")
     print("🔐 Sécurité: Commandes setup réservées au propriétaire")
     
