@@ -1,0 +1,13 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Bot logs
+bot.log
+
+# Environment variables
+.env
+
+# Temporary files
+*.tmp

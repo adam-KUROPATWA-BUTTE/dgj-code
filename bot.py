@@ -7,11 +7,13 @@ from collections import deque
 import asyncio
 import logging
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 import aiohttp
 import json
 import re
 import random
+import time
+from collections import defaultdict
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 import tempfile
@@ -56,6 +58,15 @@ SUPPORT_CONFIG = {}
 # Système de salons vocaux temporaires
 TEMP_VOCAL_CONFIG = {}
 TEMP_VOCAL_CHANNELS = {}
+
+# Système de modération et anti-raid
+SECURITY_CONFIG = {}  # Configuration anti-raid par serveur
+WHITELIST = {}        # Utilisateurs de confiance par serveur
+BLACKLIST = {}        # Utilisateurs bannis par serveur
+RAID_DETECTION = {}   # Détection de raids en cours
+SPAM_TRACKING = {}    # Suivi du spam par utilisateur
+WARNS = {}           # Système d'avertissements par serveur
+MOD_LOGS = {}        # Canaux de logs de modération par serveur
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -745,6 +756,87 @@ async def on_voice_state_update(member, before, after):
         if before.channel and before.channel.name.startswith("🎤 "):
             await cleanup_temp_vocal_channel(before.channel)
 
+@bot.event
+async def on_member_join(member):
+    """Gestion des nouveaux membres avec protection anti-raid"""
+    guild = member.guild
+    
+    # Vérifier si c'est un raid potentiel
+    await check_raid_detection(guild, member)
+    
+    # Vérifier si le compte est suspect
+    await check_suspicious_account(member)
+
+@bot.event
+async def on_message(message):
+    """Gestion des messages avec protection anti-spam"""
+    # Ignorer les messages du bot
+    if message.author.bot:
+        return
+    
+    # Ignorer les DM
+    if not message.guild:
+        return
+    
+    # Vérifier le spam
+    await check_spam_protection(message)
+    
+    # Traiter les commandes normalement
+    await bot.process_commands(message)
+
+@bot.event
+async def on_guild_channel_create(channel):
+    """Surveillance de la création massive de channels"""
+    guild = channel.guild
+    guild_id = guild.id
+    await init_security_config(guild_id)
+    
+    if not SECURITY_CONFIG[guild_id]["channel_protection"]:
+        return
+    
+    current_time = time.time()
+    
+    # Initialiser le tracking pour ce serveur
+    if guild_id not in RAID_DETECTION:
+        RAID_DETECTION[guild_id] = {"channels": [], "channel_spam": False}
+    
+    if "channels" not in RAID_DETECTION[guild_id]:
+        RAID_DETECTION[guild_id]["channels"] = []
+    
+    # Nettoyer les anciennes créations
+    threshold_time = current_time - SECURITY_CONFIG[guild_id]["channel_timeframe"]
+    RAID_DETECTION[guild_id]["channels"] = [
+        create_time for create_time in RAID_DETECTION[guild_id]["channels"] 
+        if create_time > threshold_time
+    ]
+    
+    # Ajouter la nouvelle création
+    RAID_DETECTION[guild_id]["channels"].append(current_time)
+    
+    # Vérifier si le seuil est dépassé
+    channel_count = len(RAID_DETECTION[guild_id]["channels"])
+    threshold = SECURITY_CONFIG[guild_id]["channel_threshold"]
+    
+    if channel_count >= threshold:
+        try:
+            # Log l'événement
+            await log_moderation_action(guild, "CHANNEL-SPAM", bot.user, None, f"Création massive de channels détectée - {channel_count} channels en {SECURITY_CONFIG[guild_id]['channel_timeframe']}s")
+            
+            # Avertir les admins
+            for text_channel in guild.text_channels:
+                if text_channel.permissions_for(guild.me).send_messages:
+                    embed = create_embed("⚠️ Création Massive de Channels", "Activité suspecte détectée", 0xff9900)
+                    embed.add_field(
+                        name="📊 Statistiques",
+                        value=f"**Channels créés:** {channel_count}\n**Timeframe:** {SECURITY_CONFIG[guild_id]['channel_timeframe']}s",
+                        inline=False
+                    )
+                    await text_channel.send(embed=embed)
+                    break
+                    
+        except Exception as e:
+            logger.error(f"Erreur détection spam channels: {e}")
+
 # ============================
 # COMMANDES SLASH MUSICALES
 # ============================
@@ -1107,8 +1199,9 @@ async def stats(interaction: discord.Interaction):
 async def setup_support(interaction: discord.Interaction, enable: bool = True):
     """Configuration du système de support vocal"""
     
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Vous devez être administrateur !", ephemeral=True)
+    # Restriction au propriétaire uniquement
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ Seul le propriétaire peut utiliser cette commande !", ephemeral=True)
         return
     
     await interaction.response.defer()
@@ -1227,8 +1320,9 @@ async def setup_support(interaction: discord.Interaction, enable: bool = True):
 async def setup_temp_vocal(interaction: discord.Interaction, enable: bool = True):
     """Configuration du système de salons vocaux temporaires"""
     
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Vous devez être administrateur !", ephemeral=True)
+    # Restriction au propriétaire uniquement
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ Seul le propriétaire peut utiliser cette commande !", ephemeral=True)
         return
     
     await interaction.response.defer()
@@ -1380,11 +1474,571 @@ async def temp_vocal_list(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed)
 
+# ============================
+# SYSTÈME DE MODÉRATION
+# ============================
+
+async def log_moderation_action(guild, action_type, moderator, target, reason):
+    """Log les actions de modération dans un canal dédié"""
+    guild_id = guild.id
+    
+    # Vérifier s'il y a un canal de logs configuré
+    if guild_id not in MOD_LOGS:
+        # Chercher ou créer un canal de logs
+        log_channel = None
+        for channel in guild.text_channels:
+            if channel.name in ["mod-logs", "moderation-logs", "logs"]:
+                log_channel = channel
+                break
+        
+        if not log_channel:
+            # Créer un canal de logs
+            try:
+                log_channel = await guild.create_text_channel(
+                    "mod-logs",
+                    topic="Logs automatiques des actions de modération",
+                    overwrites={
+                        guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                        guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+                    }
+                )
+            except:
+                return  # Impossible de créer le canal
+        
+        MOD_LOGS[guild_id] = log_channel.id
+    
+    log_channel = bot.get_channel(MOD_LOGS[guild_id])
+    if not log_channel:
+        return
+    
+    # Couleurs par type d'action
+    color_map = {
+        "BAN": 0xff0000,
+        "KICK": 0xff9900,
+        "TIMEOUT": 0xffaa00,
+        "WARN": 0xffaa00,
+        "CLEAR": 0x00ff00,
+        "AUTO-TIMEOUT": 0xff6600
+    }
+    
+    # Icônes par type d'action
+    icon_map = {
+        "BAN": "🔨",
+        "KICK": "👢",
+        "TIMEOUT": "⏱️",
+        "WARN": "⚠️",
+        "CLEAR": "🧹",
+        "AUTO-TIMEOUT": "🤖"
+    }
+    
+    embed = create_embed(
+        f"{icon_map.get(action_type, '📋')} Action de Modération",
+        f"**Type:** {action_type}",
+        color_map.get(action_type, 0x0099ff)
+    )
+    
+    embed.add_field(name="👤 Modérateur", value=moderator.mention, inline=True)
+    if target:
+        embed.add_field(name="🎯 Cible", value=f"{target.mention} ({target.display_name})", inline=True)
+    embed.add_field(name="📝 Raison", value=reason, inline=False)
+    embed.add_field(name="📍 Canal", value=f"<#{guild.system_channel.id}>" if guild.system_channel else "N/A", inline=True)
+    
+    try:
+        await log_channel.send(embed=embed)
+    except:
+        pass  # Erreur silencieuse si impossible d'envoyer
+
+@bot.tree.command(name="ban", description="🔨 Bannir un utilisateur")
+@app_commands.describe(
+    user="Utilisateur à bannir",
+    reason="Raison du bannissement (optionnel)"
+)
+async def ban_user(interaction: discord.Interaction, user: discord.Member, reason: str = "Aucune raison spécifiée"):
+    """Bannir un utilisateur du serveur"""
+    
+    # Vérifier les permissions d'administrateur
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Vous devez être administrateur pour utiliser cette commande !", ephemeral=True)
+        return
+    
+    # Empêcher de se bannir soi-même
+    if user.id == interaction.user.id:
+        await interaction.response.send_message("❌ Vous ne pouvez pas vous bannir vous-même !", ephemeral=True)
+        return
+    
+    # Empêcher de bannir le bot
+    if user.id == bot.user.id:
+        await interaction.response.send_message("❌ Je ne peux pas me bannir moi-même !", ephemeral=True)
+        return
+    
+    # Empêcher de bannir le propriétaire
+    if user.id == OWNER_ID:
+        await interaction.response.send_message("❌ Impossible de bannir le propriétaire du bot !", ephemeral=True)
+        return
+    
+    try:
+        await user.ban(reason=f"Banni par {interaction.user}: {reason}")
+        
+        embed = create_embed("🔨 Utilisateur Banni", f"**{user.display_name}** a été banni du serveur", 0xff0000)
+        embed.add_field(name="👤 Modérateur", value=interaction.user.mention, inline=True)
+        embed.add_field(name="📝 Raison", value=reason, inline=False)
+        
+        await interaction.response.send_message(embed=embed)
+        
+        # Log de modération
+        await log_moderation_action(interaction.guild, "BAN", interaction.user, user, reason)
+        
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Je n'ai pas les permissions pour bannir cet utilisateur !", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Erreur lors du bannissement : {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="kick", description="👢 Expulser un utilisateur")
+@app_commands.describe(
+    user="Utilisateur à expulser",
+    reason="Raison de l'expulsion (optionnel)"
+)
+async def kick_user(interaction: discord.Interaction, user: discord.Member, reason: str = "Aucune raison spécifiée"):
+    """Expulser un utilisateur du serveur"""
+    
+    # Vérifier les permissions d'administrateur
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Vous devez être administrateur pour utiliser cette commande !", ephemeral=True)
+        return
+    
+    # Empêcher de s'expulser soi-même
+    if user.id == interaction.user.id:
+        await interaction.response.send_message("❌ Vous ne pouvez pas vous expulser vous-même !", ephemeral=True)
+        return
+    
+    # Empêcher d'expulser le bot
+    if user.id == bot.user.id:
+        await interaction.response.send_message("❌ Je ne peux pas m'expulser moi-même !", ephemeral=True)
+        return
+    
+    # Empêcher d'expulser le propriétaire
+    if user.id == OWNER_ID:
+        await interaction.response.send_message("❌ Impossible d'expulser le propriétaire du bot !", ephemeral=True)
+        return
+    
+    try:
+        await user.kick(reason=f"Expulsé par {interaction.user}: {reason}")
+        
+        embed = create_embed("👢 Utilisateur Expulsé", f"**{user.display_name}** a été expulsé du serveur", 0xff9900)
+        embed.add_field(name="👤 Modérateur", value=interaction.user.mention, inline=True)
+        embed.add_field(name="📝 Raison", value=reason, inline=False)
+        
+        await interaction.response.send_message(embed=embed)
+        
+        # Log de modération
+        await log_moderation_action(interaction.guild, "KICK", interaction.user, user, reason)
+        
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Je n'ai pas les permissions pour expulser cet utilisateur !", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Erreur lors de l'expulsion : {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="timeout", description="⏱️ Mettre un utilisateur en timeout")
+@app_commands.describe(
+    user="Utilisateur à mettre en timeout",
+    duration="Durée en minutes (max 40320 = 28 jours)",
+    reason="Raison du timeout (optionnel)"
+)
+async def timeout_user(interaction: discord.Interaction, user: discord.Member, duration: int, reason: str = "Aucune raison spécifiée"):
+    """Mettre un utilisateur en timeout"""
+    
+    # Vérifier les permissions d'administrateur
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Vous devez être administrateur pour utiliser cette commande !", ephemeral=True)
+        return
+    
+    # Vérifier la durée (max 28 jours)
+    if duration < 1 or duration > 40320:  # 28 jours * 24h * 60min
+        await interaction.response.send_message("❌ La durée doit être entre 1 minute et 40320 minutes (28 jours) !", ephemeral=True)
+        return
+    
+    # Empêcher de se timeout soi-même
+    if user.id == interaction.user.id:
+        await interaction.response.send_message("❌ Vous ne pouvez pas vous mettre en timeout vous-même !", ephemeral=True)
+        return
+    
+    # Empêcher de timeout le bot
+    if user.id == bot.user.id:
+        await interaction.response.send_message("❌ Je ne peux pas me mettre en timeout moi-même !", ephemeral=True)
+        return
+    
+    # Empêcher de timeout le propriétaire
+    if user.id == OWNER_ID:
+        await interaction.response.send_message("❌ Impossible de mettre en timeout le propriétaire du bot !", ephemeral=True)
+        return
+    
+    try:
+        timeout_until = datetime.now() + timedelta(minutes=duration)
+        await user.timeout(timeout_until, reason=f"Timeout par {interaction.user}: {reason}")
+        
+        embed = create_embed("⏱️ Utilisateur en Timeout", f"**{user.display_name}** a été mis en timeout", 0xffaa00)
+        embed.add_field(name="👤 Modérateur", value=interaction.user.mention, inline=True)
+        embed.add_field(name="⏰ Durée", value=f"{duration} minute(s)", inline=True)
+        embed.add_field(name="📝 Raison", value=reason, inline=False)
+        embed.add_field(name="🕐 Fin du timeout", value=f"<t:{int(timeout_until.timestamp())}:F>", inline=False)
+        
+        await interaction.response.send_message(embed=embed)
+        
+        # Log de modération
+        await log_moderation_action(interaction.guild, "TIMEOUT", interaction.user, user, f"{reason} (Durée: {duration} minutes)")
+        
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Je n'ai pas les permissions pour mettre cet utilisateur en timeout !", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Erreur lors du timeout : {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="warn", description="⚠️ Avertir un utilisateur")
+@app_commands.describe(
+    user="Utilisateur à avertir",
+    reason="Raison de l'avertissement"
+)
+async def warn_user(interaction: discord.Interaction, user: discord.Member, reason: str):
+    """Avertir un utilisateur"""
+    
+    # Vérifier les permissions d'administrateur
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Vous devez être administrateur pour utiliser cette commande !", ephemeral=True)
+        return
+    
+    guild_id = interaction.guild.id
+    user_id = user.id
+    
+    # Initialiser le système d'avertissements pour le serveur si nécessaire
+    if guild_id not in WARNS:
+        WARNS[guild_id] = {}
+    
+    if user_id not in WARNS[guild_id]:
+        WARNS[guild_id][user_id] = []
+    
+    # Ajouter l'avertissement
+    warn_data = {
+        "reason": reason,
+        "moderator": interaction.user.id,
+        "timestamp": datetime.now().isoformat()
+    }
+    WARNS[guild_id][user_id].append(warn_data)
+    
+    warn_count = len(WARNS[guild_id][user_id])
+    
+    embed = create_embed("⚠️ Utilisateur Averti", f"**{user.display_name}** a reçu un avertissement", 0xffaa00)
+    embed.add_field(name="👤 Modérateur", value=interaction.user.mention, inline=True)
+    embed.add_field(name="📊 Total d'avertissements", value=f"{warn_count}", inline=True)
+    embed.add_field(name="📝 Raison", value=reason, inline=False)
+    
+    await interaction.response.send_message(embed=embed)
+    
+    # Log de modération
+    await log_moderation_action(interaction.guild, "WARN", interaction.user, user, reason)
+    
+    # Actions automatiques basées sur le nombre d'avertissements
+    if warn_count >= 3:
+        try:
+            timeout_until = datetime.now() + timedelta(hours=1)
+            await user.timeout(timeout_until, reason="Timeout automatique - 3 avertissements")
+            
+            auto_embed = create_embed("🤖 Action Automatique", f"**{user.display_name}** a été mis en timeout automatiquement (3 avertissements)", 0xff6600)
+            await interaction.followup.send(embed=auto_embed)
+            
+            await log_moderation_action(interaction.guild, "AUTO-TIMEOUT", bot.user, user, "3 avertissements atteints")
+            
+        except discord.Forbidden:
+            pass
+
+@bot.tree.command(name="clear", description="🧹 Supprimer des messages")
+@app_commands.describe(
+    amount="Nombre de messages à supprimer (max 100)"
+)
+async def clear_messages(interaction: discord.Interaction, amount: int):
+    """Supprimer des messages du canal"""
+    
+    # Vérifier les permissions d'administrateur
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Vous devez être administrateur pour utiliser cette commande !", ephemeral=True)
+        return
+    
+    # Vérifier le nombre de messages
+    if amount < 1 or amount > 100:
+        await interaction.response.send_message("❌ Vous devez spécifier un nombre entre 1 et 100 !", ephemeral=True)
+        return
+    
+    try:
+        # Répondre d'abord pour éviter que le message de la commande soit supprimé
+        await interaction.response.send_message(f"🧹 Suppression de {amount} message(s)...", ephemeral=True)
+        
+        # Supprimer les messages
+        deleted = await interaction.channel.purge(limit=amount)
+        
+        embed = create_embed("🧹 Messages Supprimés", f"**{len(deleted)}** message(s) supprimé(s) dans {interaction.channel.mention}", 0x00ff00)
+        embed.add_field(name="👤 Modérateur", value=interaction.user.mention, inline=True)
+        embed.add_field(name="📊 Canal", value=interaction.channel.mention, inline=True)
+        
+        # Envoyer le résultat dans un message temporaire
+        result_msg = await interaction.channel.send(embed=embed)
+        
+        # Log de modération
+        await log_moderation_action(interaction.guild, "CLEAR", interaction.user, None, f"{len(deleted)} messages supprimés dans {interaction.channel.mention}")
+        
+        # Supprimer le message de résultat après 5 secondes
+        await asyncio.sleep(5)
+        try:
+            await result_msg.delete()
+        except:
+            pass
+            
+    except discord.Forbidden:
+        await interaction.followup.send("❌ Je n'ai pas les permissions pour supprimer les messages !", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Erreur lors de la suppression : {str(e)}", ephemeral=True)
+
+# ============================
+# SYSTÈME ANTI-RAID AVANCÉ
+# ============================
+
+async def init_security_config(guild_id):
+    """Initialise la configuration de sécurité par défaut pour un serveur"""
+    if guild_id not in SECURITY_CONFIG:
+        SECURITY_CONFIG[guild_id] = {
+            "raid_detection": True,
+            "spam_protection": True,
+            "channel_protection": True,
+            "auto_ban": True,
+            "join_threshold": 5,  # Nombre de joins en X secondes pour déclencher la détection
+            "join_timeframe": 10,  # Secondes
+            "message_threshold": 5,  # Messages identiques/similaires pour spam
+            "message_timeframe": 60,  # Secondes
+            "channel_threshold": 3,  # Channels créés en X secondes
+            "channel_timeframe": 30,  # Secondes
+            "account_age_threshold": 7,  # Jours minimum d'âge du compte
+        }
+
+@bot.tree.command(name="config_security", description="🛡️ Configurer la protection anti-raid")
+@app_commands.describe(
+    module="Module à configurer",
+    enable="Activer ou désactiver le module"
+)
+@app_commands.choices(module=[
+    app_commands.Choice(name="Détection de raids", value="raid_detection"),
+    app_commands.Choice(name="Protection spam", value="spam_protection"),
+    app_commands.Choice(name="Protection channels", value="channel_protection"),
+    app_commands.Choice(name="Auto-ban comptes suspects", value="auto_ban"),
+])
+async def config_security(interaction: discord.Interaction, module: str, enable: bool):
+    """Configurer les modules de sécurité anti-raid"""
+    
+    # Vérifier les permissions d'administrateur
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Vous devez être administrateur pour utiliser cette commande !", ephemeral=True)
+        return
+    
+    guild_id = interaction.guild.id
+    await init_security_config(guild_id)
+    
+    # Mettre à jour la configuration
+    SECURITY_CONFIG[guild_id][module] = enable
+    
+    module_names = {
+        "raid_detection": "Détection de raids",
+        "spam_protection": "Protection contre le spam",
+        "channel_protection": "Protection contre la création massive de channels",
+        "auto_ban": "Auto-ban des comptes suspects"
+    }
+    
+    status = "✅ Activé" if enable else "❌ Désactivé"
+    embed = create_embed("🛡️ Configuration Sécurité", f"**{module_names[module]}** : {status}")
+    
+    # Afficher la configuration actuelle
+    config = SECURITY_CONFIG[guild_id]
+    embed.add_field(
+        name="📊 Configuration Actuelle",
+        value=(
+            f"🚨 Détection raids: {'✅' if config['raid_detection'] else '❌'}\n"
+            f"💬 Protection spam: {'✅' if config['spam_protection'] else '❌'}\n"
+            f"📁 Protection channels: {'✅' if config['channel_protection'] else '❌'}\n"
+            f"🔨 Auto-ban suspects: {'✅' if config['auto_ban'] else '❌'}"
+        ),
+        inline=False
+    )
+    
+    await interaction.response.send_message(embed=embed)
+
+async def check_raid_detection(guild, member):
+    """Vérifier si un join fait partie d'un raid potentiel"""
+    guild_id = guild.id
+    await init_security_config(guild_id)
+    
+    if not SECURITY_CONFIG[guild_id]["raid_detection"]:
+        return False
+    
+    current_time = time.time()
+    
+    # Initialiser le tracking pour ce serveur
+    if guild_id not in RAID_DETECTION:
+        RAID_DETECTION[guild_id] = {"joins": [], "raid_active": False}
+    
+    # Nettoyer les anciens joins
+    threshold_time = current_time - SECURITY_CONFIG[guild_id]["join_timeframe"]
+    RAID_DETECTION[guild_id]["joins"] = [
+        join_time for join_time in RAID_DETECTION[guild_id]["joins"] 
+        if join_time > threshold_time
+    ]
+    
+    # Ajouter le nouveau join
+    RAID_DETECTION[guild_id]["joins"].append(current_time)
+    
+    # Vérifier si le seuil est dépassé
+    join_count = len(RAID_DETECTION[guild_id]["joins"])
+    threshold = SECURITY_CONFIG[guild_id]["join_threshold"]
+    
+    if join_count >= threshold and not RAID_DETECTION[guild_id]["raid_active"]:
+        RAID_DETECTION[guild_id]["raid_active"] = True
+        await handle_raid_detected(guild)
+        return True
+    
+    return False
+
+async def handle_raid_detected(guild):
+    """Gérer la détection d'un raid"""
+    guild_id = guild.id
+    
+    # Activer le mode lockdown temporaire
+    try:
+        # Créer/modifier les permissions par défaut pour empêcher les nouveaux membres de parler
+        await guild.edit(default_notifications=discord.NotificationLevel.only_mentions)
+        
+        # Log l'événement
+        await log_moderation_action(guild, "RAID-DETECTED", bot.user, None, f"Raid détecté - {len(RAID_DETECTION[guild_id]['joins'])} joins rapides")
+        
+        # Envoyer une alerte aux admins
+        for channel in guild.text_channels:
+            if channel.permissions_for(guild.me).send_messages:
+                embed = create_embed("🚨 RAID DÉTECTÉ", "Protection automatique activée", 0xff0000)
+                embed.add_field(
+                    name="📊 Statistiques",
+                    value=f"**Joins détectés:** {len(RAID_DETECTION[guild_id]['joins'])}\n**Timeframe:** {SECURITY_CONFIG[guild_id]['join_timeframe']}s",
+                    inline=False
+                )
+                embed.add_field(
+                    name="🛡️ Actions recommandées",
+                    value="• Vérifiez les nouveaux membres\n• Utilisez `/config_security` pour ajuster la sensibilité\n• Surveillez l'activité suspecte",
+                    inline=False
+                )
+                await channel.send(embed=embed)
+                break
+        
+        # Désactiver l'alerte raid après 5 minutes
+        await asyncio.sleep(300)
+        RAID_DETECTION[guild_id]["raid_active"] = False
+        
+    except Exception as e:
+        logger.error(f"Erreur gestion raid: {e}")
+
+async def check_spam_protection(message):
+    """Vérifier et gérer le spam de messages"""
+    guild_id = message.guild.id
+    user_id = message.author.id
+    await init_security_config(guild_id)
+    
+    if not SECURITY_CONFIG[guild_id]["spam_protection"]:
+        return False
+    
+    current_time = time.time()
+    
+    # Initialiser le tracking spam
+    if guild_id not in SPAM_TRACKING:
+        SPAM_TRACKING[guild_id] = {}
+    
+    if user_id not in SPAM_TRACKING[guild_id]:
+        SPAM_TRACKING[guild_id][user_id] = []
+    
+    # Nettoyer les anciens messages
+    threshold_time = current_time - SECURITY_CONFIG[guild_id]["message_timeframe"]
+    SPAM_TRACKING[guild_id][user_id] = [
+        msg for msg in SPAM_TRACKING[guild_id][user_id] 
+        if msg["time"] > threshold_time
+    ]
+    
+    # Ajouter le nouveau message
+    SPAM_TRACKING[guild_id][user_id].append({
+        "content": message.content.lower(),
+        "time": current_time
+    })
+    
+    # Vérifier le spam
+    recent_messages = SPAM_TRACKING[guild_id][user_id]
+    if len(recent_messages) >= SECURITY_CONFIG[guild_id]["message_threshold"]:
+        # Vérifier si les messages sont similaires
+        similar_count = sum(1 for msg in recent_messages if msg["content"] == message.content.lower())
+        
+        if similar_count >= 3:  # 3 messages identiques = spam
+            await handle_spam_detected(message)
+            return True
+    
+    return False
+
+async def handle_spam_detected(message):
+    """Gérer la détection de spam"""
+    try:
+        # Supprimer les messages de spam
+        async for msg in message.channel.history(limit=50):
+            if (msg.author.id == message.author.id and 
+                msg.content.lower() == message.content.lower() and
+                (datetime.now() - msg.created_at).total_seconds() < 60):
+                await msg.delete()
+        
+        # Timeout l'utilisateur
+        timeout_until = datetime.now() + timedelta(minutes=10)
+        await message.author.timeout(timeout_until, reason="Spam automatique détecté")
+        
+        # Log l'action
+        await log_moderation_action(message.guild, "AUTO-TIMEOUT", bot.user, message.author, "Spam détecté - Timeout automatique 10 minutes")
+        
+        # Avertir dans le canal
+        embed = create_embed("🛡️ Spam Détecté", f"**{message.author.display_name}** a été mis en timeout pour spam", 0xff6600)
+        await message.channel.send(embed=embed, delete_after=10)
+        
+    except Exception as e:
+        logger.error(f"Erreur gestion spam: {e}")
+
+async def check_suspicious_account(member):
+    """Vérifier si un compte est suspect"""
+    guild_id = member.guild.id
+    await init_security_config(guild_id)
+    
+    if not SECURITY_CONFIG[guild_id]["auto_ban"]:
+        return False
+    
+    # Vérifier l'âge du compte
+    account_age = (datetime.now() - member.created_at).days
+    threshold = SECURITY_CONFIG[guild_id]["account_age_threshold"]
+    
+    if account_age < threshold:
+        # Vérifier si le compte est dans la whitelist
+        if guild_id in WHITELIST and member.id in WHITELIST[guild_id]:
+            return False
+        
+        # Compte suspect détecté
+        try:
+            await member.ban(reason=f"Compte suspect - Âge: {account_age} jours (seuil: {threshold})")
+            await log_moderation_action(member.guild, "AUTO-BAN", bot.user, member, f"Compte suspect - Âge: {account_age} jours")
+            return True
+        except:
+            return False
+    
+    return False
+
 @bot.tree.command(name="help", description="❓ Aide complète")
 async def help_command(interaction: discord.Interaction):
     """Affiche l'aide complète du bot"""
     
-    embed = create_embed("🎵 Bot Musical Direct Pro + Salons Vocaux", "Système complet de musique et support vocal")
+    is_owner = interaction.user.id == OWNER_ID
+    is_admin = interaction.user.guild_permissions.administrator
+    
+    embed = create_embed("🎵 Bot Musical Direct Pro + Salons Vocaux + Modération", "Système complet de musique, support vocal et modération")
     
     embed.add_field(
         name="🎶 Commandes Musicales",
@@ -1401,43 +2055,54 @@ async def help_command(interaction: discord.Interaction):
         inline=False
     )
     
-    embed.add_field(
-        name="🎯 Avantages Musicaux",
-        value=(
-            "• **8 méthodes yt-dlp** ultra robustes\n"
-            "• **Pas de serveur Lavalink** - Plus stable\n"
-            "• **5 radios de fallback** automatiques\n"
-            "• **Support Spotify** avec conversion\n"
-            "• **Queue intelligente** avec gestion d'erreurs"
-        ),
-        inline=False
-    )
+    # Commandes de modération (pour les admins)
+    if is_admin:
+        embed.add_field(
+            name="🛡️ Commandes de Modération",
+            value=(
+                "`/ban <utilisateur> [raison]` - Bannir un utilisateur\n"
+                "`/kick <utilisateur> [raison]` - Expulser un utilisateur\n"
+                "`/timeout <utilisateur> <durée> [raison]` - Timeout temporaire\n"
+                "`/warn <utilisateur> <raison>` - Avertir un utilisateur\n"
+                "`/clear <nombre>` - Supprimer des messages\n"
+                "`/config_security <module> <enable>` - Configurer la sécurité"
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="🔒 Protection Anti-Raid",
+            value=(
+                "• **Détection automatique** de raids (joins massifs)\n"
+                "• **Protection anti-spam** avec timeout automatique\n"
+                "• **Surveillance channels** contre la création massive\n"
+                "• **Auto-ban** des comptes suspects (âge < 7 jours)\n"
+                "• **Logs automatiques** de toutes les actions\n"
+                "• **Configuration flexible** par serveur"
+            ),
+            inline=False
+        )
+    
+    # Commandes de configuration (pour le propriétaire uniquement)
+    if is_owner:
+        embed.add_field(
+            name="⚙️ Configuration (Propriétaire uniquement)",
+            value=(
+                "`/setup enable:True/False` - Configurer le support vocal\n"
+                "`/setup_temp_vocal enable:True/False` - Configurer les salons temporaires"
+            ),
+            inline=False
+        )
     
     embed.add_field(
-        name="🎧 Support Vocal Automatique",
+        name="🎤 Salons Vocaux",
         value=(
-            "`/setup enable:True` - Configurer le support\n"
-            "`/setup enable:False` - Désactiver le support\n\n"
+            "`/temp_vocal_list` - Voir les salons temporaires actifs\n\n"
             "**Fonctionnalités automatiques :**\n"
-            "• Channel d'attente → Channels privés\n"
-            "• Détection automatique des admins\n"
-            "• Gestion des permissions\n"
+            "• Support vocal intelligent avec channels privés\n"
+            "• Salons temporaires avec création à la demande\n"
+            "• Gestion automatique des permissions\n"
             "• Nettoyage automatique des channels vides"
-        ),
-        inline=False
-    )
-    
-    embed.add_field(
-        name="🎤 Salons Vocaux Temporaires",
-        value=(
-            "`/setup_temp_vocal enable:True` - Configurer les salons temporaires\n"
-            "`/setup_temp_vocal enable:False` - Désactiver les salons temporaires\n"
-            "`/temp_vocal_list` - Voir les salons actifs\n\n"
-            "**Fonctionnalités automatiques :**\n"
-            "• Channel de création → Salons personnalisés\n"
-            "• Permissions de gestion pour le créateur\n"
-            "• Suppression automatique quand vide\n"
-            "• Format: 🎤 [Nom utilisateur]"
         ),
         inline=False
     )
@@ -1448,7 +2113,8 @@ async def help_command(interaction: discord.Interaction):
             "**yt-dlp 2025.06.30** - 8 méthodes d'extraction\n"
             "**FFmpeg optimisé** - Lecture audio haute qualité\n"
             "**Spotify Web API** - Métadonnées et conversion\n"
-            "**Discord.py** - Intégration native Discord"
+            "**Discord.py** - Intégration native Discord\n"
+            "**Système anti-raid** - Protection avancée"
         ),
         inline=False
     )
@@ -1458,24 +2124,24 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "`/stats` - Statistiques d'extraction\n"
             "`/help` - Cette aide\n\n"
-            f"**Version :** 2025-06-30\n"
+            f"**Version :** 2025-06-30 + Modération\n"
             f"**Utilisateur :** adam-KUROPATWA-BUTTE\n"
             f"**Serveurs :** {len(bot.guilds)}"
         ),
         inline=False
     )
     
-    embed.add_field(
-        name="🚀 Exemples d'utilisation",
-        value=(
-            "`/play never gonna give you up`\n"
-            "`/spotify NINAO GIMS`\n"
-            "`/soundcloud lofi hip hop`\n"
-            "`/setup enable:True`\n"
-            "`/setup_temp_vocal enable:True`"
-        ),
-        inline=False
-    )
+    if is_admin:
+        embed.add_field(
+            name="🚀 Exemples Modération",
+            value=(
+                "`/ban @utilisateur Spam répété`\n"
+                "`/timeout @utilisateur 60 Comportement inapproprié`\n"
+                "`/clear 10` - Supprimer 10 messages\n"
+                "`/config_security raid_detection True`"
+            ),
+            inline=False
+        )
     
     await interaction.response.send_message(embed=embed)
 
