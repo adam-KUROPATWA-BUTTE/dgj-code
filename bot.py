@@ -1363,4 +1363,175 @@ async def temp_vocal_list(interaction: discord.Interaction):
     
     for i, channel_info in enumerate(TEMP_VOCAL_CHANNELS[guild_id][:10], 1):
         channel = bot.get_channel(channel_info['channel_id'])
-        
+                if channel:
+            creator = bot.get_user(channel_info['creator_id'])
+            creator_name = creator.display_name if creator else "Utilisateur inconnu"
+            member_count = len(channel.members)
+            created_time = channel_info['created_at'].strftime("%H:%M")
+            
+            embed.add_field(
+                name=f"🎤 {channel.name}",
+                value=f"👤 Créateur: {creator_name}\n👥 Membres: {member_count}\n🕐 Créé: {created_time}",
+                inline=True
+            )
+    
+    if len(TEMP_VOCAL_CHANNELS[guild_id]) > 10:
+        embed.add_field(name="➕", value=f"... et {len(TEMP_VOCAL_CHANNELS[guild_id]) - 10} autres", inline=False)
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="help", description="❓ Aide complète")
+async def help_command(interaction: discord.Interaction):
+    """Affiche l'aide complète du bot"""
+    
+    embed = create_embed("🎵 Bot Musical Direct Pro + Salons Vocaux", "Système complet de musique et support vocal")
+    
+    embed.add_field(
+        name="🎶 Commandes Musicales",
+        value=(
+            "`/play <chanson>` - YouTube avec 8 méthodes d'extraction\n"
+            "`/spotify <chanson/lien>` - Spotify → YouTube\n"
+            "`/soundcloud <chanson/lien>` - SoundCloud direct\n"
+            "`/radio` - Lancer une radio en continu\n"
+            "`/queue` - Voir la liste d'attente\n"
+            "`/skip` - Passer à la chanson suivante\n"
+            "`/stop` - Arrêter et vider la queue\n"
+            "`/disconnect` - Déconnecter le bot"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🎯 Avantages Musicaux",
+        value=(
+            "• **8 méthodes yt-dlp** ultra robustes\n"
+            "• **Pas de serveur Lavalink** - Plus stable\n"
+            "• **5 radios de fallback** automatiques\n"
+            "• **Support Spotify** avec conversion\n"
+            "• **Queue intelligente** avec gestion d'erreurs"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🎧 Support Vocal Automatique",
+        value=(
+            "`/setup enable:True` - Configurer le support\n"
+            "`/setup enable:False` - Désactiver le support\n\n"
+            "**Fonctionnalités automatiques :**\n"
+            "• Channel d'attente → Channels privés\n"
+            "• Détection automatique des admins\n"
+            "• Gestion des permissions\n"
+            "• Nettoyage automatique des channels vides"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🎤 Salons Vocaux Temporaires",
+        value=(
+            "`/setup_temp_vocal enable:True` - Configurer les salons temporaires\n"
+            "`/setup_temp_vocal enable:False` - Désactiver les salons temporaires\n"
+            "`/temp_vocal_list` - Voir les salons actifs\n\n"
+            "**Fonctionnalités automatiques :**\n"
+            "• Channel de création → Salons personnalisés\n"
+            "• Permissions de gestion pour le créateur\n"
+            "• Suppression automatique quand vide\n"
+            "• Format: 🎤 [Nom utilisateur]"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🔥 Technologies",
+        value=(
+            "**yt-dlp 2025.06.30** - 8 méthodes d'extraction\n"
+            "**FFmpeg optimisé** - Lecture audio haute qualité\n"
+            "**Spotify Web API** - Métadonnées et conversion\n"
+            "**Discord.py** - Intégration native Discord"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="📊 Informations",
+        value=(
+            "`/stats` - Statistiques d'extraction\n"
+            "`/help` - Cette aide\n\n"
+            f"**Version :** 2025-06-30\n"
+            f"**Utilisateur :** adam-KUROPATWA-BUTTE\n"
+            f"**Serveurs :** {len(bot.guilds)}"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🚀 Exemples d'utilisation",
+        value=(
+            "`/play never gonna give you up`\n"
+            "`/spotify NINAO GIMS`\n"
+            "`/soundcloud lofi hip hop`\n"
+            "`/setup enable:True`\n"
+            "`/setup_temp_vocal enable:True`"
+        ),
+        inline=False
+    )
+    
+    await interaction.response.send_message(embed=embed)
+
+# Commande de debug pour vérifier les commandes
+@bot.tree.command(name="debug", description="🔧 Debug - Informations système")
+async def debug_command(interaction: discord.Interaction):
+    """Commande de debug pour les développeurs"""
+    
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ Réservé au propriétaire", ephemeral=True)
+        return
+    
+    commands_list = []
+    for cmd in bot.tree.get_commands():
+        commands_list.append(f"• `/{cmd.name}` - {cmd.description}")
+    
+    embed = create_embed("🔧 Debug - Informations Système", f"État du bot à {datetime.now().strftime('%H:%M:%S')}")
+    
+    embed.add_field(name="📋 Commandes synchronisées", value=f"{len(commands_list)} commandes", inline=True)
+    embed.add_field(name="🏠 Serveurs", value=str(len(bot.guilds)), inline=True)
+    embed.add_field(name="👤 Utilisateur", value="adam-KUROPATWA-BUTTE", inline=True)
+    
+    if len(commands_list) <= 10:
+        embed.add_field(name="🎯 Liste des commandes", value="\n".join(commands_list), inline=False)
+    else:
+        embed.add_field(name="🎯 Premières commandes", value="\n".join(commands_list[:10]), inline=False)
+    
+    embed.add_field(name="📊 Stats extraction", value=f"Succès: {EXTRACTION_STATS['success']}\nÉchecs: {EXTRACTION_STATS['failed']}", inline=True)
+    embed.add_field(name="🎧 Support actif", value=str(len(SUPPORT_CHANNELS)), inline=True)
+    embed.add_field(name="🎵 Queues actives", value=str(len(SONG_QUEUES)), inline=True)
+    
+    # Statistiques des salons temporaires
+    total_temp_channels = sum(len(channels) for channels in TEMP_VOCAL_CHANNELS.values())
+    embed.add_field(name="🎤 Salons temp actifs", value=str(total_temp_channels), inline=True)
+    embed.add_field(name="🏠 Serveurs avec temp vocal", value=str(len(TEMP_VOCAL_CONFIG)), inline=True)
+    embed.add_field(name="🎯 Intents", value="✅ Tous configurés", inline=True)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ============================
+# LANCEMENT
+# ============================
+
+if __name__ == "__main__":
+    print("🚀 Démarrage du BOT MUSICAL DIRECT COMPLET + SALONS VOCAUX...")
+    print("🔥 Technologie: yt-dlp direct (8 méthodes robustes)")
+    print("🎯 Sources: YouTube + SoundCloud + Spotify + 5 Radios")
+    print("🎧 Support vocal: Système automatique intelligent")
+    print("🎤 Salons temporaires: Création automatique personnalisée")
+    print("📻 Fallback: Radio garantie si extraction échoue")
+    print("🎵 Queue: Gestion intelligente avec retry automatique")
+    print("👤 Développé pour: adam-KUROPATWA-BUTTE")
+    print("📅 Version: 2025-06-30 23:05:20 UTC")
+    
+    try:
+        bot.run(BOT_TOKEN)
+    except Exception as e:
+        logger.error(f"❌ Erreur critique: {e}")
+        print("💡 Vérifiez que DISCORD_TOKEN est correct dans le fichier .env")
