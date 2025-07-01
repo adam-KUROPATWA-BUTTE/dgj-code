@@ -3,11 +3,11 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
-from collections import deque
+from collections import deque, defaultdict
 import asyncio
 import logging
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 import aiohttp
 import json
 import re
@@ -57,16 +57,233 @@ SUPPORT_CONFIG = {}
 TEMP_VOCAL_CONFIG = {}
 TEMP_VOCAL_CHANNELS = {}
 
+# ============================
+# SYSTÈME DE MODÉRATION ET ANTI-RAID
+# ============================
+
+# Configuration de sécurité par serveur
+SECURITY_CONFIG = {}
+
+# Système d'avertissements
+WARNINGS = defaultdict(list)
+
+# Système anti-raid
+RAID_PROTECTION = {}
+JOIN_TRACKER = defaultdict(list)
+MESSAGE_TRACKER = defaultdict(list)
+
+# Configuration par défaut pour la sécurité
+DEFAULT_SECURITY_CONFIG = {
+    "enabled": True,
+    "max_joins_per_minute": 5,
+    "max_messages_per_minute": 10,
+    "auto_ban_suspicious": True,
+    "log_channel_id": None,
+    "whitelist": [],
+    "blacklist": [],
+    "raid_mode": False,
+    "max_warns": 3,
+    "timeout_duration": 300,  # 5 minutes
+    "delete_spam_messages": True,
+    "anti_spam_enabled": True,
+    "anti_raid_enabled": True,
+    "new_account_threshold": 7,  # jours
+    "punishment_type": "timeout"  # timeout, kick, ban
+}
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 intents.guilds = True
 intents.members = True
+intents.moderation = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ============================
-# SPOTIFY API
+# FONCTIONS UTILITAIRES DE SÉCURITÉ
+# ============================
+
+def get_security_config(guild_id):
+    """Récupère la configuration de sécurité d'un serveur"""
+    if guild_id not in SECURITY_CONFIG:
+        SECURITY_CONFIG[guild_id] = DEFAULT_SECURITY_CONFIG.copy()
+    return SECURITY_CONFIG[guild_id]
+
+def is_admin(member):
+    """Vérifie si un membre est administrateur"""
+    return member.guild_permissions.administrator
+
+def is_suspicious_account(member):
+    """Détecte si un compte est suspect"""
+    config = get_security_config(member.guild.id)
+    
+    # Compte trop récent
+    account_age = (datetime.now() - member.created_at).days
+    if account_age < config["new_account_threshold"]:
+        return True, f"Compte créé il y a {account_age} jour(s)"
+    
+    # Pas d'avatar
+    if not member.avatar:
+        return True, "Pas d'avatar"
+    
+    # Nom suspect (que des chiffres ou caractères spéciaux)
+    if re.match(r'^[0-9\W]+$', member.display_name):
+        return True, "Nom suspect"
+    
+    return False, None
+
+async def log_action(guild, action_type, moderator, target, reason, duration=None):
+    """Log une action de modération"""
+    config = get_security_config(guild.id)
+    
+    if not config["log_channel_id"]:
+        return
+    
+    log_channel = guild.get_channel(config["log_channel_id"])
+    if not log_channel:
+        return
+    
+    embed = discord.Embed(
+        title=f"🔧 Action de Modération - {action_type.upper()}",
+        color=0xff6b6b if action_type in ["ban", "kick"] else 0xffa726,
+        timestamp=datetime.now()
+    )
+    
+    embed.add_field(name="👤 Utilisateur", value=f"{target.mention} ({target.id})", inline=True)
+    embed.add_field(name="👮 Modérateur", value=f"{moderator.mention}", inline=True)
+    embed.add_field(name="📋 Raison", value=reason or "Aucune raison spécifiée", inline=False)
+    
+    if duration:
+        embed.add_field(name="⏱️ Durée", value=f"{duration} secondes", inline=True)
+    
+    embed.set_footer(text=f"Bot de Modération - {guild.name}")
+    
+    try:
+        await log_channel.send(embed=embed)
+    except Exception as e:
+        logger.error(f"❌ Erreur log modération: {e}")
+
+# ============================
+# SYSTÈME ANTI-RAID
+# ============================
+
+async def check_raid_protection(member):
+    """Vérifie et applique la protection anti-raid"""
+    guild = member.guild
+    config = get_security_config(guild.id)
+    
+    if not config["anti_raid_enabled"]:
+        return
+    
+    now = datetime.now()
+    guild_id = guild.id
+    
+    # Ajouter à la liste des joins récents
+    JOIN_TRACKER[guild_id].append(now)
+    
+    # Nettoyer les anciens joins (plus de 1 minute)
+    JOIN_TRACKER[guild_id] = [
+        join_time for join_time in JOIN_TRACKER[guild_id]
+        if (now - join_time).seconds < 60
+    ]
+    
+    recent_joins = len(JOIN_TRACKER[guild_id])
+    
+    # Si trop de joins récents, activer le mode raid
+    if recent_joins > config["max_joins_per_minute"]:
+        config["raid_mode"] = True
+        logger.warning(f"🚨 Mode raid activé sur {guild.name} - {recent_joins} joins en 1 minute")
+        
+        # Notifier les modérateurs
+        for channel in guild.text_channels:
+            if channel.permissions_for(guild.me).send_messages:
+                embed = discord.Embed(
+                    title="🚨 MODE RAID ACTIVÉ",
+                    description=f"**{recent_joins} utilisateurs** ont rejoint en moins d'une minute !",
+                    color=0xff0000
+                )
+                embed.add_field(name="🛡️ Mesures prises", value="• Surveillance renforcée\n• Auto-ban des comptes suspects\n• Vérification manuelle recommandée", inline=False)
+                await channel.send(embed=embed)
+                break
+    
+    # Si en mode raid, vérifier si le compte est suspect
+    if config["raid_mode"] and config["auto_ban_suspicious"]:
+        is_suspect, reason = is_suspicious_account(member)
+        
+        if is_suspect:
+            try:
+                await member.ban(reason=f"Auto-ban anti-raid: {reason}")
+                logger.info(f"🔨 Auto-ban anti-raid: {member} - {reason}")
+                
+                # Log l'action
+                await log_action(guild, "auto-ban", guild.me, member, f"Anti-raid: {reason}")
+                
+            except Exception as e:
+                logger.error(f"❌ Erreur auto-ban: {e}")
+
+async def check_message_spam(message):
+    """Vérifie et gère le spam de messages"""
+    if message.author.bot:
+        return
+    
+    guild = message.guild
+    if not guild:
+        return
+    
+    config = get_security_config(guild.id)
+    
+    if not config["anti_spam_enabled"]:
+        return
+    
+    user_id = message.author.id
+    now = datetime.now()
+    
+    # Ajouter le message à la liste
+    MESSAGE_TRACKER[user_id].append(now)
+    
+    # Nettoyer les anciens messages (plus de 1 minute)
+    MESSAGE_TRACKER[user_id] = [
+        msg_time for msg_time in MESSAGE_TRACKER[user_id]
+        if (now - msg_time).seconds < 60
+    ]
+    
+    recent_messages = len(MESSAGE_TRACKER[user_id])
+    
+    # Si trop de messages récents
+    if recent_messages > config["max_messages_per_minute"]:
+        # Supprimer les messages spam si activé
+        if config["delete_spam_messages"]:
+            try:
+                await message.delete()
+            except:
+                pass
+        
+        # Punir l'utilisateur selon la configuration
+        punishment = config["punishment_type"]
+        reason = f"Spam détecté - {recent_messages} messages en 1 minute"
+        
+        try:
+            if punishment == "timeout":
+                timeout_until = datetime.now() + timedelta(seconds=config["timeout_duration"])
+                await message.author.timeout(timeout_until, reason=reason)
+                
+            elif punishment == "kick":
+                await message.author.kick(reason=reason)
+                
+            elif punishment == "ban":
+                await message.author.ban(reason=reason)
+            
+            # Log l'action
+            await log_action(guild, f"anti-spam-{punishment}", guild.me, message.author, reason)
+            
+            logger.info(f"🚫 Anti-spam {punishment}: {message.author} - {reason}")
+            
+        except Exception as e:
+            logger.error(f"❌ Erreur punition anti-spam: {e}")
+
+# ============================
+# SPOTIFY API (identique)
 # ============================
 
 spotify_client = None
@@ -147,7 +364,7 @@ async def search_spotify_metadata(query):
     return None
 
 # ============================
-# YT-DLP DIRECT - MÉTHODES ROBUSTES
+# YT-DLP DIRECT - MÉTHODES ROBUSTES (identique)
 # ============================
 
 async def extract_with_ytdlp(query, source_type="youtube"):
@@ -310,7 +527,7 @@ async def extract_with_ytdlp(query, source_type="youtube"):
     return None
 
 # ============================
-# LECTURE AUDIO DIRECTE
+# LECTURE AUDIO DIRECTE (identique)
 # ============================
 
 async def play_extracted_audio(voice_client, audio_info, channel):
@@ -428,7 +645,7 @@ async def play_radio_fallback(voice_client, channel):
     return False
 
 # ============================
-# SYSTÈME DE SUPPORT COMPLET
+# SYSTÈME DE SUPPORT COMPLET (identique)
 # ============================
 
 async def handle_support_join(member, waiting_channel):
@@ -515,7 +732,7 @@ async def cleanup_empty_support_channel(channel):
                 logger.error(f"❌ Erreur suppression channel: {e}")
 
 # ============================
-# SYSTÈME DE SALONS VOCAUX TEMPORAIRES
+# SYSTÈME DE SALONS VOCAUX TEMPORAIRES (identique)
 # ============================
 
 async def handle_temp_vocal_join(member, create_channel):
@@ -657,7 +874,7 @@ def format_duration(seconds):
 def create_embed(title, description, color=0x00ff00):
     embed = discord.Embed(title=title, description=description, color=color)
     embed.timestamp = datetime.now()
-    embed.set_footer(text="🎵 Bot Musical Direct Pro + Salons Vocaux - 2025-06-30")
+    embed.set_footer(text="🎵 Bot Musical Direct Pro + Modération Anti-Raid - 2025-07-01")
     return embed
 
 # ============================
@@ -700,11 +917,11 @@ async def on_ready():
     
     await bot.change_presence(
         status=discord.Status.online,
-        activity=discord.Activity(type=discord.ActivityType.listening, name="/play - Musique + Salons vocaux !")
+        activity=discord.Activity(type=discord.ActivityType.watching, name="/help - Musique + Modération + Salons vocaux !")
     )
     
     print("=" * 80)
-    print(f"🎵 BOT MUSICAL DIRECT COMPLET + SALONS VOCAUX PRÊT !")
+    print(f"🎵 BOT COMPLET AVEC MODÉRATION ET ANTI-RAID PRÊT !")
     print(f"👤 Connecté: {bot.user.name}")
     print(f"🏠 Serveurs: {len(bot.guilds)}")
     print(f"🎧 Spotify API: {'✅ Configurée' if spotify_client else '⚠️ Non configurée'}")
@@ -712,9 +929,22 @@ async def on_ready():
     print(f"🎯 Sources: YouTube direct + SoundCloud + Spotify→YouTube")
     print(f"🎧 Support: Système vocal automatique")
     print(f"🎤 Salons vocaux: Création automatique temporaire")
+    print(f"🛡️ Modération: Ban/Kick/Timeout/Warn/Clear")
+    print(f"🚨 Anti-Raid: Protection automatique avancée")
     print(f"📻 Radio: 5 stations de fallback")
-    print(f"📋 Commandes: /play, /spotify, /soundcloud, /queue, /skip, /setup, /setup_temp_vocal, /help")
+    print(f"📋 Commandes: /play, /ban, /kick, /timeout, /warn, /clear, /config_security")
     print("=" * 80)
+
+@bot.event
+async def on_member_join(member):
+    """Événement quand un membre rejoint"""
+    await check_raid_protection(member)
+
+@bot.event
+async def on_message(message):
+    """Événement pour chaque message"""
+    await check_message_spam(message)
+    await bot.process_commands(message)
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -746,7 +976,7 @@ async def on_voice_state_update(member, before, after):
             await cleanup_temp_vocal_channel(before.channel)
 
 # ============================
-# COMMANDES SLASH MUSICALES
+# COMMANDES SLASH MUSICALES (identiques à l'original)
 # ============================
 
 @bot.tree.command(name="play", description="🎵 Jouer une chanson (8 méthodes yt-dlp)")
@@ -1067,48 +1297,399 @@ async def disconnect(interaction: discord.Interaction):
     embed = create_embed("📞 Déconnecté", "Bot déconnecté du vocal")
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="stats", description="📊 Statistiques du bot")
-async def stats(interaction: discord.Interaction):
-    """Affiche les statistiques"""
+# ============================
+# COMMANDES DE MODÉRATION
+# ============================
+
+@bot.tree.command(name="ban", description="🔨 Bannir un utilisateur")
+@app_commands.describe(
+    user="Utilisateur à bannir",
+    reason="Raison du bannissement",
+    delete_messages="Supprimer les messages (en jours, 0-7)"
+)
+async def ban_user(interaction: discord.Interaction, user: discord.Member, reason: str = None, delete_messages: int = 0):
+    """Bannir un utilisateur"""
     
-    total = EXTRACTION_STATS["success"] + EXTRACTION_STATS["failed"]
-    success_rate = (EXTRACTION_STATS["success"] / total * 100) if total > 0 else 0
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ Vous devez être administrateur !", ephemeral=True)
+        return
     
-    embed = create_embed("📊 Statistiques Bot Musical Direct", f"Depuis le démarrage - {datetime.now().strftime('%H:%M:%S')}")
+    if user.id == interaction.user.id:
+        await interaction.response.send_message("❌ Vous ne pouvez pas vous bannir vous-même !", ephemeral=True)
+        return
     
-    embed.add_field(name="✅ Succès", value=str(EXTRACTION_STATS["success"]), inline=True)
-    embed.add_field(name="❌ Échecs", value=str(EXTRACTION_STATS["failed"]), inline=True)
-    embed.add_field(name="📈 Taux de réussite", value=f"{success_rate:.1f}%", inline=True)
+    if user.id == OWNER_ID:
+        await interaction.response.send_message("❌ Impossible de bannir le propriétaire du bot !", ephemeral=True)
+        return
     
-    embed.add_field(name="🎥 YouTube", value=str(EXTRACTION_STATS["youtube"]), inline=True)
-    embed.add_field(name="🔊 SoundCloud", value=str(EXTRACTION_STATS["soundcloud"]), inline=True)
-    embed.add_field(name="🎧 Spotify", value=str(EXTRACTION_STATS["spotify"]), inline=True)
+    if is_admin(user):
+        await interaction.response.send_message("❌ Impossible de bannir un administrateur !", ephemeral=True)
+        return
     
-    # Statistiques des salons vocaux temporaires
-    total_temp_channels = sum(len(channels) for channels in TEMP_VOCAL_CHANNELS.values())
-    embed.add_field(name="🎤 Salons temporaires actifs", value=str(total_temp_channels), inline=True)
-    embed.add_field(name="🏠 Serveurs avec salons temp", value=str(len(TEMP_VOCAL_CONFIG)), inline=True)
-    embed.add_field(name="🎧 Serveurs avec support", value=str(len(SUPPORT_CHANNELS)), inline=True)
+    delete_messages = max(0, min(7, delete_messages))
     
-    embed.add_field(name="🔥 Technologie", value="yt-dlp direct (8 méthodes)\nFFmpeg optimisé\n5 radios fallback\nSalons vocaux automatiques", inline=False)
-    embed.add_field(name="🎯 Sources", value="YouTube + SoundCloud + Spotify→YouTube + Radio", inline=False)
+    try:
+        await user.ban(reason=reason, delete_message_days=delete_messages)
+        
+        embed = create_embed("🔨 Utilisateur banni", f"**{user.display_name}** a été banni du serveur", 0xff6b6b)
+        embed.add_field(name="👮 Modérateur", value=interaction.user.mention, inline=True)
+        embed.add_field(name="📋 Raison", value=reason or "Aucune raison spécifiée", inline=True)
+        embed.add_field(name="🗑️ Messages supprimés", value=f"{delete_messages} jour(s)", inline=True)
+        
+        await interaction.response.send_message(embed=embed)
+        
+        # Log l'action
+        await log_action(interaction.guild, "ban", interaction.user, user, reason)
+        
+        logger.info(f"🔨 {interaction.user} a banni {user} - Raison: {reason}")
+        
+    except Exception as e:
+        embed = create_embed("❌ Erreur", f"Impossible de bannir {user.display_name}: {str(e)}", 0xff0000)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="kick", description="👢 Expulser un utilisateur")
+@app_commands.describe(
+    user="Utilisateur à expulser",
+    reason="Raison de l'expulsion"
+)
+async def kick_user(interaction: discord.Interaction, user: discord.Member, reason: str = None):
+    """Expulser un utilisateur"""
     
-    # Informations système
-    embed.add_field(name="🖥️ Système", value=f"Serveurs: {len(bot.guilds)}\nUtilisateur: adam-KUROPATWA-BUTTE", inline=False)
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ Vous devez être administrateur !", ephemeral=True)
+        return
+    
+    if user.id == interaction.user.id:
+        await interaction.response.send_message("❌ Vous ne pouvez pas vous expulser vous-même !", ephemeral=True)
+        return
+    
+    if user.id == OWNER_ID:
+        await interaction.response.send_message("❌ Impossible d'expulser le propriétaire du bot !", ephemeral=True)
+        return
+    
+    if is_admin(user):
+        await interaction.response.send_message("❌ Impossible d'expulser un administrateur !", ephemeral=True)
+        return
+    
+    try:
+        await user.kick(reason=reason)
+        
+        embed = create_embed("👢 Utilisateur expulsé", f"**{user.display_name}** a été expulsé du serveur", 0xffa726)
+        embed.add_field(name="👮 Modérateur", value=interaction.user.mention, inline=True)
+        embed.add_field(name="📋 Raison", value=reason or "Aucune raison spécifiée", inline=True)
+        
+        await interaction.response.send_message(embed=embed)
+        
+        # Log l'action
+        await log_action(interaction.guild, "kick", interaction.user, user, reason)
+        
+        logger.info(f"👢 {interaction.user} a expulsé {user} - Raison: {reason}")
+        
+    except Exception as e:
+        embed = create_embed("❌ Erreur", f"Impossible d'expulser {user.display_name}: {str(e)}", 0xff0000)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="timeout", description="⏰ Timeout temporaire d'un utilisateur")
+@app_commands.describe(
+    user="Utilisateur à timeout",
+    duration="Durée en minutes (1-1440)",
+    reason="Raison du timeout"
+)
+async def timeout_user(interaction: discord.Interaction, user: discord.Member, duration: int, reason: str = None):
+    """Timeout temporaire d'un utilisateur"""
+    
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ Vous devez être administrateur !", ephemeral=True)
+        return
+    
+    if user.id == interaction.user.id:
+        await interaction.response.send_message("❌ Vous ne pouvez pas vous timeout vous-même !", ephemeral=True)
+        return
+    
+    if user.id == OWNER_ID:
+        await interaction.response.send_message("❌ Impossible de timeout le propriétaire du bot !", ephemeral=True)
+        return
+    
+    if is_admin(user):
+        await interaction.response.send_message("❌ Impossible de timeout un administrateur !", ephemeral=True)
+        return
+    
+    duration = max(1, min(1440, duration))  # Entre 1 minute et 24 heures
+    
+    try:
+                timeout_until = datetime.now() + timedelta(minutes=duration)
+        await user.timeout(timeout_until, reason=reason)
+        
+        embed = create_embed("⏰ Utilisateur en timeout", f"**{user.display_name}** a été mis en timeout", 0xffa726)
+        embed.add_field(name="👮 Modérateur", value=interaction.user.mention, inline=True)
+        embed.add_field(name="⏱️ Durée", value=f"{duration} minute(s)", inline=True)
+        embed.add_field(name="📋 Raison", value=reason or "Aucune raison spécifiée", inline=False)
+        
+        await interaction.response.send_message(embed=embed)
+        
+        # Log l'action
+        await log_action(interaction.guild, "timeout", interaction.user, user, reason, duration*60)
+        
+        logger.info(f"⏰ {interaction.user} a timeout {user} pour {duration} minutes - Raison: {reason}")
+        
+    except Exception as e:
+        embed = create_embed("❌ Erreur", f"Impossible de timeout {user.display_name}: {str(e)}", 0xff0000)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="warn", description="⚠️ Avertir un utilisateur")
+@app_commands.describe(
+    user="Utilisateur à avertir",
+    reason="Raison de l'avertissement"
+)
+async def warn_user(interaction: discord.Interaction, user: discord.Member, reason: str = None):
+    """Avertir un utilisateur"""
+    
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ Vous devez être administrateur !", ephemeral=True)
+        return
+    
+    if user.id == interaction.user.id:
+        await interaction.response.send_message("❌ Vous ne pouvez pas vous avertir vous-même !", ephemeral=True)
+        return
+    
+    if user.id == OWNER_ID:
+        await interaction.response.send_message("❌ Impossible d'avertir le propriétaire du bot !", ephemeral=True)
+        return
+    
+    config = get_security_config(interaction.guild_id)
+    
+    # Ajouter l'avertissement
+    warn_data = {
+        'moderator': interaction.user.id,
+        'reason': reason or "Aucune raison spécifiée",
+        'timestamp': datetime.now()
+    }
+    
+    WARNINGS[user.id].append(warn_data)
+    warn_count = len(WARNINGS[user.id])
+    
+    embed = create_embed("⚠️ Utilisateur averti", f"**{user.display_name}** a reçu un avertissement", 0xffa726)
+    embed.add_field(name="👮 Modérateur", value=interaction.user.mention, inline=True)
+    embed.add_field(name="📊 Avertissements", value=f"{warn_count}/{config['max_warns']}", inline=True)
+    embed.add_field(name="📋 Raison", value=reason or "Aucune raison spécifiée", inline=False)
+    
+    # Vérifier si l'utilisateur a atteint le maximum d'avertissements
+    if warn_count >= config['max_warns']:
+        try:
+            timeout_until = datetime.now() + timedelta(seconds=config['timeout_duration'])
+            await user.timeout(timeout_until, reason=f"Maximum d'avertissements atteint ({warn_count})")
+            embed.add_field(name="🚨 Action automatique", value=f"Timeout de {config['timeout_duration']//60} minutes appliqué", inline=False)
+            
+            # Reset les avertissements après punition
+            WARNINGS[user.id] = []
+            
+        except Exception as e:
+            embed.add_field(name="❌ Erreur", value=f"Impossible d'appliquer le timeout automatique: {str(e)}", inline=False)
+    
+    await interaction.response.send_message(embed=embed)
+    
+    # Log l'action
+    await log_action(interaction.guild, "warn", interaction.user, user, reason)
+    
+    logger.info(f"⚠️ {interaction.user} a averti {user} ({warn_count}/{config['max_warns']}) - Raison: {reason}")
+
+@bot.tree.command(name="clear", description="🧹 Supprimer des messages")
+@app_commands.describe(
+    amount="Nombre de messages à supprimer (1-100)",
+    user="Supprimer seulement les messages de cet utilisateur (optionnel)"
+)
+async def clear_messages(interaction: discord.Interaction, amount: int, user: discord.Member = None):
+    """Supprimer des messages"""
+    
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ Vous devez être administrateur !", ephemeral=True)
+        return
+    
+    amount = max(1, min(100, amount))
+    
+    try:
+        if user:
+            # Supprimer les messages d'un utilisateur spécifique
+            def check(message):
+                return message.author == user
+            
+            deleted = await interaction.channel.purge(limit=amount*2, check=check)
+            deleted_count = len(deleted)
+            
+            embed = create_embed("🧹 Messages supprimés", f"**{deleted_count}** messages de **{user.display_name}** ont été supprimés", 0x66bb6a)
+        else:
+            # Supprimer les derniers messages
+            deleted = await interaction.channel.purge(limit=amount)
+            deleted_count = len(deleted)
+            
+            embed = create_embed("🧹 Messages supprimés", f"**{deleted_count}** messages ont été supprimés", 0x66bb6a)
+        
+        embed.add_field(name="👮 Modérateur", value=interaction.user.mention, inline=True)
+        embed.add_field(name="📍 Channel", value=interaction.channel.mention, inline=True)
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        
+        # Log l'action
+        target_info = f"de {user.display_name}" if user else "génériques"
+        await log_action(interaction.guild, "clear", interaction.user, user or interaction.guild.me, f"{deleted_count} messages {target_info}")
+        
+        logger.info(f"🧹 {interaction.user} a supprimé {deleted_count} messages dans {interaction.channel}")
+        
+    except Exception as e:
+        embed = create_embed("❌ Erreur", f"Impossible de supprimer les messages: {str(e)}", 0xff0000)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="warns", description="📋 Voir les avertissements d'un utilisateur")
+@app_commands.describe(user="Utilisateur à vérifier")
+async def view_warns(interaction: discord.Interaction, user: discord.Member):
+    """Voir les avertissements d'un utilisateur"""
+    
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ Vous devez être administrateur !", ephemeral=True)
+        return
+    
+    warnings = WARNINGS.get(user.id, [])
+    
+    if not warnings:
+        embed = create_embed("📋 Avertissements", f"**{user.display_name}** n'a aucun avertissement", 0x66bb6a)
+        await interaction.response.send_message(embed=embed)
+        return
+    
+    embed = create_embed("📋 Avertissements", f"**{user.display_name}** - {len(warnings)} avertissement(s)", 0xffa726)
+    
+    for i, warn in enumerate(warnings[-10:], 1):  # Afficher les 10 derniers
+        moderator = interaction.guild.get_member(warn['moderator'])
+        moderator_name = moderator.display_name if moderator else "Modérateur inconnu"
+        
+        embed.add_field(
+            name=f"⚠️ Avertissement {i}",
+            value=f"**Modérateur:** {moderator_name}\n**Raison:** {warn['reason']}\n**Date:** {warn['timestamp'].strftime('%d/%m/%Y %H:%M')}",
+            inline=False
+        )
+    
+    if len(warnings) > 10:
+        embed.add_field(name="➕", value=f"... et {len(warnings) - 10} autres", inline=False)
     
     await interaction.response.send_message(embed=embed)
 
 # ============================
-# COMMANDES SETUP AMÉLIORÉES
+# CONFIGURATION DE SÉCURITÉ
 # ============================
 
-@bot.tree.command(name="setup", description="⚙️ Configurer le support vocal automatique")
+@bot.tree.command(name="config_security", description="🛡️ Configurer la sécurité anti-raid")
+@app_commands.describe(
+    setting="Paramètre à modifier",
+    value="Nouvelle valeur"
+)
+@app_commands.choices(setting=[
+    app_commands.Choice(name="🚨 Anti-raid activé", value="anti_raid_enabled"),
+    app_commands.Choice(name="💬 Anti-spam activé", value="anti_spam_enabled"),
+    app_commands.Choice(name="👥 Max joins/minute", value="max_joins_per_minute"),
+    app_commands.Choice(name="📝 Max messages/minute", value="max_messages_per_minute"),
+    app_commands.Choice(name="🔨 Auto-ban suspects", value="auto_ban_suspicious"),
+    app_commands.Choice(name="⚠️ Max avertissements", value="max_warns"),
+    app_commands.Choice(name="⏰ Durée timeout (min)", value="timeout_duration"),
+    app_commands.Choice(name="🗑️ Supprimer spam", value="delete_spam_messages"),
+    app_commands.Choice(name="👶 Seuil nouveau compte (jours)", value="new_account_threshold"),
+    app_commands.Choice(name="⚖️ Type de punition", value="punishment_type")
+])
+async def config_security(interaction: discord.Interaction, setting: str, value: str):
+    """Configurer la sécurité anti-raid"""
+    
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ Vous devez être administrateur !", ephemeral=True)
+        return
+    
+    config = get_security_config(interaction.guild_id)
+    
+    try:
+        if setting in ["anti_raid_enabled", "anti_spam_enabled", "auto_ban_suspicious", "delete_spam_messages"]:
+            config[setting] = value.lower() in ['true', '1', 'yes', 'oui', 'on']
+            
+        elif setting in ["max_joins_per_minute", "max_messages_per_minute", "max_warns", "new_account_threshold"]:
+            config[setting] = max(1, int(value))
+            
+        elif setting == "timeout_duration":
+            config[setting] = max(60, min(86400, int(value) * 60))  # Convert minutes to seconds
+            
+        elif setting == "punishment_type":
+            if value.lower() in ["timeout", "kick", "ban"]:
+                config[setting] = value.lower()
+            else:
+                await interaction.response.send_message("❌ Type de punition invalide ! Utilisez: timeout, kick, ou ban", ephemeral=True)
+                return
+        
+        embed = create_embed("✅ Configuration mise à jour", f"**{setting}** = `{value}`", 0x66bb6a)
+        embed.add_field(name="👮 Modérateur", value=interaction.user.mention, inline=True)
+        
+        await interaction.response.send_message(embed=embed)
+        
+        logger.info(f"⚙️ {interaction.user} a modifié {setting} = {value} sur {interaction.guild.name}")
+        
+    except ValueError:
+        await interaction.response.send_message("❌ Valeur invalide ! Vérifiez le type de données requis.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Erreur: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="security_status", description="📊 Voir l'état de la sécurité")
+async def security_status(interaction: discord.Interaction):
+    """Afficher l'état de la sécurité"""
+    
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ Vous devez être administrateur !", ephemeral=True)
+        return
+    
+    config = get_security_config(interaction.guild_id)
+    
+    embed = create_embed("🛡️ État de la Sécurité", f"Configuration pour **{interaction.guild.name}**", 0x5865f2)
+    
+    # Protection anti-raid
+    raid_status = "✅ Activée" if config["anti_raid_enabled"] else "❌ Désactivée"
+    embed.add_field(name="🚨 Protection Anti-Raid", value=raid_status, inline=True)
+    
+    spam_status = "✅ Activée" if config["anti_spam_enabled"] else "❌ Désactivée"
+    embed.add_field(name="💬 Protection Anti-Spam", value=spam_status, inline=True)
+    
+    mode_raid = "🔴 MODE RAID ACTIF" if config.get("raid_mode", False) else "🟢 Normal"
+    embed.add_field(name="🚨 Mode Actuel", value=mode_raid, inline=True)
+    
+    # Limites
+    embed.add_field(name="👥 Max joins/minute", value=str(config["max_joins_per_minute"]), inline=True)
+    embed.add_field(name="📝 Max messages/minute", value=str(config["max_messages_per_minute"]), inline=True)
+    embed.add_field(name="⚠️ Max avertissements", value=str(config["max_warns"]), inline=True)
+    
+    # Auto-actions
+    auto_ban = "✅ Activé" if config["auto_ban_suspicious"] else "❌ Désactivé"
+    embed.add_field(name="🔨 Auto-ban suspects", value=auto_ban, inline=True)
+    
+    delete_spam = "✅ Activé" if config["delete_spam_messages"] else "❌ Désactivé"
+    embed.add_field(name="🗑️ Suppr. spam", value=delete_spam, inline=True)
+    
+    embed.add_field(name="⚖️ Type punition", value=config["punishment_type"].title(), inline=True)
+    
+    # Statistiques
+    total_warns = sum(len(warns) for warns in WARNINGS.values())
+    embed.add_field(name="📊 Avertissements total", value=str(total_warns), inline=True)
+    
+    recent_joins = len(JOIN_TRACKER.get(interaction.guild_id, []))
+    embed.add_field(name="👥 Joins récents", value=str(recent_joins), inline=True)
+    
+    timeout_min = config["timeout_duration"] // 60
+    embed.add_field(name="⏰ Timeout auto", value=f"{timeout_min} min", inline=True)
+    
+    await interaction.response.send_message(embed=embed)
+
+# ============================
+# COMMANDES SETUP SÉCURISÉES (OWNER ONLY)
+# ============================
+
+@bot.tree.command(name="setup", description="⚙️ [OWNER] Configurer le support vocal")
 @app_commands.describe(enable="Activer ou désactiver le système de support")
 async def setup_support(interaction: discord.Interaction, enable: bool = True):
-    """Configuration du système de support vocal"""
+    """Configuration du système de support vocal - OWNER ONLY"""
     
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Vous devez être administrateur !", ephemeral=True)
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ Cette commande est réservée au propriétaire du bot !", ephemeral=True)
         return
     
     await interaction.response.defer()
@@ -1126,7 +1707,7 @@ async def setup_support(interaction: discord.Interaction, enable: bool = True):
             return
     
     try:
-        # Rechercher ou créer la catégorie de support
+        # [Le reste du code setup identique à l'original]
         category = None
         for cat in guild.categories:
             if cat.name == "🎧 Support Vocal":
@@ -1140,7 +1721,6 @@ async def setup_support(interaction: discord.Interaction, enable: bool = True):
             }
             category = await guild.create_category("🎧 Support Vocal", overwrites=overwrites)
         
-        # Rechercher ou créer le channel d'attente
         waiting_channel_name = "⏳│Besoin d'aide"
         waiting_channel = None
         
@@ -1155,11 +1735,9 @@ async def setup_support(interaction: discord.Interaction, enable: bool = True):
                 guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True, move_members=True)
             }
             
-            # Chercher le rôle admin automatiquement
             admin_role = None
             admin_role_id = None
             
-            # Essayer de trouver un rôle admin par nom
             for role in guild.roles:
                 role_name_lower = role.name.lower()
                 if any(keyword in role_name_lower for keyword in ['admin', 'modér', 'staff', 'gérant', 'owner', 'fondateur']):
@@ -1167,7 +1745,6 @@ async def setup_support(interaction: discord.Interaction, enable: bool = True):
                     admin_role_id = role.id
                     break
             
-            # Si pas trouvé par nom, chercher par permissions
             if not admin_role:
                 for role in guild.roles:
                     if role.permissions.administrator:
@@ -1175,12 +1752,10 @@ async def setup_support(interaction: discord.Interaction, enable: bool = True):
                         admin_role_id = role.id
                         break
             
-            # Dernier recours : propriétaire du serveur
             if not admin_role_id:
                 admin_role_id = guild.owner_id
                 admin_role = guild.owner
             
-            # Ajouter les permissions pour les admins
             if admin_role and hasattr(admin_role, 'id'):
                 overwrites[admin_role] = discord.PermissionOverwrite(
                     view_channel=True, connect=True, speak=True, move_members=True, manage_channels=True
@@ -1188,11 +1763,9 @@ async def setup_support(interaction: discord.Interaction, enable: bool = True):
             
             waiting_channel = await category.create_voice_channel(waiting_channel_name, overwrites=overwrites, user_limit=0)
         
-        # Configurer le système
         SUPPORT_CONFIG[guild_id] = {"admin_role_id": admin_role_id, "category_id": category.id}
         SUPPORT_CHANNELS[guild_id] = {"waiting": waiting_channel.id, "active": []}
         
-        # Message de confirmation détaillé
         embed = create_embed("✅ Système de Support Configuré", "Support vocal automatique activé avec succès !")
         embed.add_field(name="⏳ Channel d'attente", value=f"{waiting_channel.mention}", inline=True)
         embed.add_field(name="🏷️ Catégorie", value=f"{category.name}", inline=True)
@@ -1202,33 +1775,21 @@ async def setup_support(interaction: discord.Interaction, enable: bool = True):
         elif admin_role_id:
             embed.add_field(name="👑 Admin", value=f"<@{admin_role_id}>", inline=True)
         
-        embed.add_field(
-            name="🔧 Fonctionnement",
-            value=(
-                "• **Étape 1 :** Les utilisateurs rejoignent le channel d'attente\n"
-                "• **Étape 2 :** Ils sont automatiquement déplacés vers un channel privé\n"
-                "• **Étape 3 :** Les admins peuvent les rejoindre pour aider\n"
-                "• **Étape 4 :** Les channels vides sont supprimés automatiquement"
-            ),
-            inline=False
-        )
-        
         await interaction.followup.send(embed=embed)
-        
-        logger.info(f"✅ Support configuré pour {guild.name} (ID: {guild_id}) avec admin: {admin_role_id}")
+        logger.info(f"✅ Support configuré pour {guild.name} par OWNER")
         
     except Exception as e:
         logger.error(f"❌ Erreur setup: {e}")
         embed = create_embed("❌ Erreur Configuration", f"Impossible de configurer le support:\n`{str(e)}`", 0xff0000)
         await interaction.followup.send(embed=embed)
 
-@bot.tree.command(name="setup_temp_vocal", description="🎤 Configurer les salons vocaux temporaires")
+@bot.tree.command(name="setup_temp_vocal", description="🎤 [OWNER] Configurer les salons temporaires")
 @app_commands.describe(enable="Activer ou désactiver le système de salons temporaires")
 async def setup_temp_vocal(interaction: discord.Interaction, enable: bool = True):
-    """Configuration du système de salons vocaux temporaires"""
+    """Configuration des salons vocaux temporaires - OWNER ONLY"""
     
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Vous devez être administrateur !", ephemeral=True)
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("❌ Cette commande est réservée au propriétaire du bot !", ephemeral=True)
         return
     
     await interaction.response.defer()
@@ -1237,17 +1798,16 @@ async def setup_temp_vocal(interaction: discord.Interaction, enable: bool = True
     guild_id = guild.id
     
     if not enable:
-        # Désactiver les salons temporaires
         if guild_id in TEMP_VOCAL_CONFIG:
             del TEMP_VOCAL_CONFIG[guild_id]
             if guild_id in TEMP_VOCAL_CHANNELS:
                 del TEMP_VOCAL_CHANNELS[guild_id]
-            embed = create_embed("🎤 Salons temporaires désactivés", "Système de salons vocaux temporaires désactivé")
+            embed = create_embed("🎤 Salons temporaires désactivés", "Système désactivé")
             await interaction.followup.send(embed=embed)
             return
     
     try:
-        # Rechercher ou créer la catégorie vocale
+        # [Reste du code setup_temp_vocal identique]
         category = None
         for cat in guild.categories:
             if "vocal" in cat.name.lower():
@@ -1261,7 +1821,6 @@ async def setup_temp_vocal(interaction: discord.Interaction, enable: bool = True
             }
             category = await guild.create_category("🎤 Salons Vocaux", overwrites=overwrites)
         
-        # Rechercher ou créer le channel "Créer un salon vocal"
         create_channel_name = "➕│Créer un salon vocal"
         create_channel = None
         
@@ -1279,10 +1838,9 @@ async def setup_temp_vocal(interaction: discord.Interaction, enable: bool = True
             create_channel = await category.create_voice_channel(
                 create_channel_name, 
                 overwrites=overwrites, 
-                user_limit=1  # Limite à 1 pour éviter l'encombrement
+                user_limit=1
             )
         
-        # Configurer le système
         TEMP_VOCAL_CONFIG[guild_id] = {
             "category_id": category.id,
             "create_channel_id": create_channel.id
@@ -1291,100 +1849,27 @@ async def setup_temp_vocal(interaction: discord.Interaction, enable: bool = True
         if guild_id not in TEMP_VOCAL_CHANNELS:
             TEMP_VOCAL_CHANNELS[guild_id] = []
         
-        # Message de confirmation détaillé
-        embed = create_embed("✅ Salons Vocaux Temporaires Configurés", "Système de création automatique activé avec succès !")
+        embed = create_embed("✅ Salons Vocaux Temporaires Configurés", "Système activé avec succès !")
         embed.add_field(name="➕ Channel de création", value=f"{create_channel.mention}", inline=True)
         embed.add_field(name="🏷️ Catégorie", value=f"{category.name}", inline=True)
-        embed.add_field(name="🎤 Format des salons", value="🎤 [Nom utilisateur]", inline=True)
-        
-        embed.add_field(
-            name="🔧 Fonctionnement",
-            value=(
-                "• **Étape 1 :** Rejoignez le channel de création\n"
-                "• **Étape 2 :** Un salon personnel est créé automatiquement\n"
-                "• **Étape 3 :** Vous êtes déplacé vers votre salon\n"
-                "• **Étape 4 :** Le salon est supprimé quand il devient vide"
-            ),
-            inline=False
-        )
-        
-        embed.add_field(
-            name="🎯 Avantages",
-            value=(
-                "• Salons personnalisés avec votre nom\n"
-                "• Permissions de gestion pour le créateur\n"
-                "• Nettoyage automatique\n"
-                "• Limite de 10 utilisateurs par salon"
-            ),
-            inline=False
-        )
-        
-        embed.add_field(
-            name="🛠️ Permissions du créateur",
-            value=(
-                "• Gérer le salon\n"
-                "• Déplacer les membres\n"
-                "• Modifier les paramètres\n"
-                "• Contrôler l'accès"
-            ),
-            inline=False
-        )
         
         await interaction.followup.send(embed=embed)
-        
-        logger.info(f"✅ Salons vocaux temporaires configurés pour {guild.name} (ID: {guild_id})")
+        logger.info(f"✅ Salons temporaires configurés pour {guild.name} par OWNER")
         
     except Exception as e:
         logger.error(f"❌ Erreur setup salons temporaires: {e}")
-        embed = create_embed("❌ Erreur Configuration", f"Impossible de configurer les salons temporaires:\n`{str(e)}`", 0xff0000)
-        embed.add_field(
-            name="🔧 Solutions possibles",
-            value=(
-                "• Vérifiez que le bot a les permissions `Gérer les channels`\n"
-                "• Vérifiez que le bot a les permissions `Déplacer les membres`\n"
-                "• Réessayez dans quelques secondes"
-            ),
-            inline=False
-        )
+        embed = create_embed("❌ Erreur Configuration", f"Erreur: {str(e)}", 0xff0000)
         await interaction.followup.send(embed=embed)
 
-@bot.tree.command(name="temp_vocal_list", description="📋 Voir les salons vocaux temporaires actifs")
-async def temp_vocal_list(interaction: discord.Interaction):
-    """Liste les salons vocaux temporaires actifs"""
-    
-    guild_id = interaction.guild_id
-    
-    if guild_id not in TEMP_VOCAL_CHANNELS or not TEMP_VOCAL_CHANNELS[guild_id]:
-        embed = create_embed("📋 Aucun salon temporaire", "Aucun salon vocal temporaire actuel")
-        await interaction.response.send_message(embed=embed)
-        return
-    
-    embed = create_embed("📋 Salons Vocaux Temporaires", f"{len(TEMP_VOCAL_CHANNELS[guild_id])} salon(s) actif(s)")
-    
-    for i, channel_info in enumerate(TEMP_VOCAL_CHANNELS[guild_id][:10], 1):
-        channel = bot.get_channel(channel_info['channel_id'])
-                if channel:
-            creator = bot.get_user(channel_info['creator_id'])
-            creator_name = creator.display_name if creator else "Utilisateur inconnu"
-            member_count = len(channel.members)
-            created_time = channel_info['created_at'].strftime("%H:%M")
-            
-            embed.add_field(
-                name=f"🎤 {channel.name}",
-                value=f"👤 Créateur: {creator_name}\n👥 Membres: {member_count}\n🕐 Créé: {created_time}",
-                inline=True
-            )
-    
-    if len(TEMP_VOCAL_CHANNELS[guild_id]) > 10:
-        embed.add_field(name="➕", value=f"... et {len(TEMP_VOCAL_CHANNELS[guild_id]) - 10} autres", inline=False)
-    
-    await interaction.response.send_message(embed=embed)
+# ============================
+# AIDE MISE À JOUR
+# ============================
 
 @bot.tree.command(name="help", description="❓ Aide complète")
 async def help_command(interaction: discord.Interaction):
     """Affiche l'aide complète du bot"""
     
-    embed = create_embed("🎵 Bot Musical Direct Pro + Salons Vocaux", "Système complet de musique et support vocal")
+    embed = create_embed("🎵 Bot Musical Direct Pro + Modération Anti-Raid", "Système complet de musique, modération et support vocal")
     
     embed.add_field(
         name="🎶 Commandes Musicales",
@@ -1402,13 +1887,28 @@ async def help_command(interaction: discord.Interaction):
     )
     
     embed.add_field(
-        name="🎯 Avantages Musicaux",
+        name="⚖️ Commandes de Modération",
         value=(
-            "• **8 méthodes yt-dlp** ultra robustes\n"
-            "• **Pas de serveur Lavalink** - Plus stable\n"
-            "• **5 radios de fallback** automatiques\n"
-            "• **Support Spotify** avec conversion\n"
-            "• **Queue intelligente** avec gestion d'erreurs"
+            "`/ban <user> [raison]` - Bannir un utilisateur\n"
+            "`/kick <user> [raison]` - Expulser un utilisateur\n"
+            "`/timeout <user> <durée> [raison]` - Timeout temporaire\n"
+            "`/warn <user> [raison]` - Avertir un utilisateur\n"
+            "`/warns <user>` - Voir les avertissements\n"
+            "`/clear <nombre> [user]` - Supprimer des messages"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🛡️ Système Anti-Raid",
+        value=(
+            "`/config_security` - Configurer la protection\n"
+            "`/security_status` - Voir l'état de la sécurité\n\n"
+            "**Protection automatique :**\n"
+            "• Détection de raids (joins massifs)\n"
+            "• Anti-spam intelligent\n"
+            "• Auto-ban des comptes suspects\n"
+            "• Logs détaillés des actions"
         ),
         inline=False
     )
@@ -1416,8 +1916,6 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="🎧 Support Vocal Automatique",
         value=(
-            "`/setup enable:True` - Configurer le support\n"
-            "`/setup enable:False` - Désactiver le support\n\n"
             "**Fonctionnalités automatiques :**\n"
             "• Channel d'attente → Channels privés\n"
             "• Détection automatique des admins\n"
@@ -1430,8 +1928,6 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="🎤 Salons Vocaux Temporaires",
         value=(
-            "`/setup_temp_vocal enable:True` - Configurer les salons temporaires\n"
-            "`/setup_temp_vocal enable:False` - Désactiver les salons temporaires\n"
             "`/temp_vocal_list` - Voir les salons actifs\n\n"
             "**Fonctionnalités automatiques :**\n"
             "• Channel de création → Salons personnalisés\n"
@@ -1443,46 +1939,92 @@ async def help_command(interaction: discord.Interaction):
     )
     
     embed.add_field(
-        name="🔥 Technologies",
-        value=(
-            "**yt-dlp 2025.06.30** - 8 méthodes d'extraction\n"
-            "**FFmpeg optimisé** - Lecture audio haute qualité\n"
-            "**Spotify Web API** - Métadonnées et conversion\n"
-            "**Discord.py** - Intégration native Discord"
-        ),
-        inline=False
-    )
-    
-    embed.add_field(
         name="📊 Informations",
         value=(
             "`/stats` - Statistiques d'extraction\n"
             "`/help` - Cette aide\n\n"
-            f"**Version :** 2025-06-30\n"
-            f"**Utilisateur :** adam-KUROPATWA-BUTTE\n"
+            f"**Version :** 2025-07-01 avec Anti-Raid\n"
+            f"**Développeur :** adam-KUROPATWA-BUTTE\n"
             f"**Serveurs :** {len(bot.guilds)}"
-        ),
-        inline=False
-    )
-    
-    embed.add_field(
-        name="🚀 Exemples d'utilisation",
-        value=(
-            "`/play never gonna give you up`\n"
-            "`/spotify NINAO GIMS`\n"
-            "`/soundcloud lofi hip hop`\n"
-            "`/setup enable:True`\n"
-            "`/setup_temp_vocal enable:True`"
         ),
         inline=False
     )
     
     await interaction.response.send_message(embed=embed)
 
-# Commande de debug pour vérifier les commandes
-@bot.tree.command(name="debug", description="🔧 Debug - Informations système")
+@bot.tree.command(name="stats", description="📊 Statistiques complètes du bot")
+async def stats(interaction: discord.Interaction):
+    """Affiche les statistiques complètes"""
+    
+    total = EXTRACTION_STATS["success"] + EXTRACTION_STATS["failed"]
+    success_rate = (EXTRACTION_STATS["success"] / total * 100) if total > 0 else 0
+    
+    embed = create_embed("📊 Statistiques Bot Complet", f"Depuis le démarrage - {datetime.now().strftime('%H:%M:%S')}")
+    
+    # Stats musicales
+    embed.add_field(name="✅ Extractions réussies", value=str(EXTRACTION_STATS["success"]), inline=True)
+    embed.add_field(name="❌ Extractions échouées", value=str(EXTRACTION_STATS["failed"]), inline=True)
+    embed.add_field(name="📈 Taux de réussite", value=f"{success_rate:.1f}%", inline=True)
+    
+    embed.add_field(name="🎥 YouTube", value=str(EXTRACTION_STATS["youtube"]), inline=True)
+    embed.add_field(name="🔊 SoundCloud", value=str(EXTRACTION_STATS["soundcloud"]), inline=True)
+    embed.add_field(name="🎧 Spotify", value=str(EXTRACTION_STATS["spotify"]), inline=True)
+    
+    # Stats modération
+    total_warns = sum(len(warns) for warns in WARNINGS.values())
+    guilds_with_security = len([g for g in SECURITY_CONFIG.values() if g.get("enabled", True)])
+    
+    embed.add_field(name="⚠️ Avertissements total", value=str(total_warns), inline=True)
+    embed.add_field(name="🛡️ Serveurs protégés", value=str(guilds_with_security), inline=True)
+    embed.add_field(name="🚨 Modes raid actifs", value=str(len([c for c in SECURITY_CONFIG.values() if c.get("raid_mode", False)])), inline=True)
+    
+    # Stats salons
+    total_temp_channels = sum(len(channels) for channels in TEMP_VOCAL_CHANNELS.values())
+    embed.add_field(name="🎤 Salons temporaires actifs", value=str(total_temp_channels), inline=True)
+    embed.add_field(name="🏠 Serveurs avec salons temp", value=str(len(TEMP_VOCAL_CONFIG)), inline=True)
+    embed.add_field(name="🎧 Serveurs avec support", value=str(len(SUPPORT_CHANNELS)), inline=True)
+    
+    embed.add_field(name="🔥 Technologie", value="yt-dlp direct (8 méthodes)\nFFmpeg optimisé\n5 radios fallback\nAnti-raid avancé", inline=False)
+    embed.add_field(name="🎯 Fonctionnalités", value="Musique + Modération + Support + Salons + Anti-Raid", inline=False)
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="temp_vocal_list", description="📋 Voir les salons vocaux temporaires actifs")
+async def temp_vocal_list(interaction: discord.Interaction):
+    """Liste les salons vocaux temporaires actifs"""
+    
+    guild_id = interaction.guild_id
+    
+    if guild_id not in TEMP_VOCAL_CHANNELS or not TEMP_VOCAL_CHANNELS[guild_id]:
+        embed = create_embed("📋 Aucun salon temporaire", "Aucun salon vocal temporaire actuel")
+        await interaction.response.send_message(embed=embed)
+        return
+    
+    embed = create_embed("📋 Salons Vocaux Temporaires", f"{len(TEMP_VOCAL_CHANNELS[guild_id])} salon(s) actif(s)")
+    
+    for i, channel_info in enumerate(TEMP_VOCAL_CHANNELS[guild_id][:10], 1):
+        channel = bot.get_channel(channel_info['channel_id'])
+        if channel:
+            creator = bot.get_user(channel_info['creator_id'])
+            creator_name = creator.display_name if creator else "Utilisateur inconnu"
+            member_count = len(channel.members)
+            created_time = channel_info['created_at'].strftime("%H:%M")
+            
+            embed.add_field(
+                name=f"🎤 {channel.name}",
+                value=f"👤 Créateur: {creator_name}\n👥 Membres: {member_count}\n🕐 Créé: {created_time}",
+                inline=True
+            )
+    
+    if len(TEMP_VOCAL_CHANNELS[guild_id]) > 10:
+        embed.add_field(name="➕", value=f"... et {len(TEMP_VOCAL_CHANNELS[guild_id]) - 10} autres", inline=False)
+    
+    await interaction.response.send_message(embed=embed)
+
+# Commande de debug réservée au propriétaire
+@bot.tree.command(name="debug", description="🔧 [OWNER] Debug système")
 async def debug_command(interaction: discord.Interaction):
-    """Commande de debug pour les développeurs"""
+    """Commande de debug pour le propriétaire"""
     
     if interaction.user.id != OWNER_ID:
         await interaction.response.send_message("❌ Réservé au propriétaire", ephemeral=True)
@@ -1496,21 +2038,15 @@ async def debug_command(interaction: discord.Interaction):
     
     embed.add_field(name="📋 Commandes synchronisées", value=f"{len(commands_list)} commandes", inline=True)
     embed.add_field(name="🏠 Serveurs", value=str(len(bot.guilds)), inline=True)
-    embed.add_field(name="👤 Utilisateur", value="adam-KUROPATWA-BUTTE", inline=True)
-    
-    if len(commands_list) <= 10:
-        embed.add_field(name="🎯 Liste des commandes", value="\n".join(commands_list), inline=False)
-    else:
-        embed.add_field(name="🎯 Premières commandes", value="\n".join(commands_list[:10]), inline=False)
+    embed.add_field(name="👤 Développeur", value="adam-KUROPATWA-BUTTE", inline=True)
     
     embed.add_field(name="📊 Stats extraction", value=f"Succès: {EXTRACTION_STATS['success']}\nÉchecs: {EXTRACTION_STATS['failed']}", inline=True)
-    embed.add_field(name="🎧 Support actif", value=str(len(SUPPORT_CHANNELS)), inline=True)
+    embed.add_field(name="🛡️ Sécurité active", value=str(len(SECURITY_CONFIG)), inline=True)
     embed.add_field(name="🎵 Queues actives", value=str(len(SONG_QUEUES)), inline=True)
     
-    # Statistiques des salons temporaires
     total_temp_channels = sum(len(channels) for channels in TEMP_VOCAL_CHANNELS.values())
     embed.add_field(name="🎤 Salons temp actifs", value=str(total_temp_channels), inline=True)
-    embed.add_field(name="🏠 Serveurs avec temp vocal", value=str(len(TEMP_VOCAL_CONFIG)), inline=True)
+    embed.add_field(name="🎧 Support actif", value=str(len(SUPPORT_CHANNELS)), inline=True)
     embed.add_field(name="🎯 Intents", value="✅ Tous configurés", inline=True)
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -1520,15 +2056,18 @@ async def debug_command(interaction: discord.Interaction):
 # ============================
 
 if __name__ == "__main__":
-    print("🚀 Démarrage du BOT MUSICAL DIRECT COMPLET + SALONS VOCAUX...")
+    print("🚀 Démarrage du BOT COMPLET AVEC MODÉRATION ET ANTI-RAID...")
     print("🔥 Technologie: yt-dlp direct (8 méthodes robustes)")
     print("🎯 Sources: YouTube + SoundCloud + Spotify + 5 Radios")
+    print("🛡️ Modération: Ban/Kick/Timeout/Warn/Clear avec logs")
+    print("🚨 Anti-Raid: Protection automatique intelligente")
     print("🎧 Support vocal: Système automatique intelligent")
     print("🎤 Salons temporaires: Création automatique personnalisée")
     print("📻 Fallback: Radio garantie si extraction échoue")
     print("🎵 Queue: Gestion intelligente avec retry automatique")
     print("👤 Développé pour: adam-KUROPATWA-BUTTE")
-    print("📅 Version: 2025-06-30 23:05:20 UTC")
+    print("📅 Version: 2025-07-01 14:15:21 UTC - ÉDITION COMPLÈTE")
+    print("🔐 Sécurité: Commandes setup réservées au propriétaire")
     
     try:
         bot.run(BOT_TOKEN)
