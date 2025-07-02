@@ -16,7 +16,7 @@ import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 import tempfile
 import urllib.parse
-from config_manager import get_guild_config, update_guild_config, get_voice_temp_settings
+from config_manager import get_guild_config, update_guild_config, get_voice_temp_settings, load_all_data, save_all_data, auto_save_data
 
 # Configuration du logging
 logging.basicConfig(
@@ -73,21 +73,21 @@ RAID_PROTECTION = {}
 JOIN_TRACKER = defaultdict(list)
 MESSAGE_TRACKER = defaultdict(list)
 
-# Configuration par défaut pour la sécurité
+# Configuration par défaut pour la sécurité - DÉSACTIVÉE par défaut
 DEFAULT_SECURITY_CONFIG = {
-    "enabled": True,
+    "enabled": False,
     "max_joins_per_minute": 5,
     "max_messages_per_minute": 35,
-    "auto_ban_suspicious": True,
+    "auto_ban_suspicious": False,
     "log_channel_id": None,
     "whitelist": [],
     "blacklist": [],
     "raid_mode": False,
     "max_warns": 3,
     "timeout_duration": 300,  # 5 minutes
-    "delete_spam_messages": True,
-    "anti_spam_enabled": True,
-    "anti_raid_enabled": True,
+    "delete_spam_messages": False,
+    "anti_spam_enabled": False,
+    "anti_raid_enabled": False,
     "new_account_threshold": 7,  # jours
     "punishment_type": "timeout"  # timeout, kick, ban
 }
@@ -977,6 +977,42 @@ async def on_ready():
     print(f"🤖 {bot.user} est connecté et prêt !")
     print(f"🏠 Serveurs: {len(bot.guilds)}")
     
+    # ============================
+    # RECHARGEMENT AUTOMATIQUE DE TOUTES LES DONNÉES
+    # ============================
+    print("🔄 Rechargement de toutes les données sauvegardées...")
+    try:
+        global WARNINGS, SONG_QUEUES, LOOP_MODES, CURRENT_SONGS
+        global SUPPORT_CHANNELS, SUPPORT_CONFIG, TEMP_VOCAL_CONFIG, TEMP_VOCAL_CHANNELS
+        global RAID_PROTECTION, JOIN_TRACKER, MESSAGE_TRACKER, EXTRACTION_STATS
+        
+        # Charger toutes les données depuis le JSON
+        loaded_data = load_all_data()
+        
+        # Restaurer toutes les variables globales
+        WARNINGS = loaded_data["warnings"]
+        SONG_QUEUES = loaded_data["song_queues"]
+        LOOP_MODES = loaded_data["loop_modes"]
+        CURRENT_SONGS = loaded_data["current_songs"]
+        SUPPORT_CHANNELS = loaded_data["support_channels"]
+        SUPPORT_CONFIG = loaded_data["support_config"]
+        TEMP_VOCAL_CONFIG = loaded_data["temp_vocal_config"]
+        TEMP_VOCAL_CHANNELS = loaded_data["temp_vocal_channels"]
+        RAID_PROTECTION = loaded_data["raid_protection"]
+        JOIN_TRACKER = loaded_data["join_tracker"]
+        MESSAGE_TRACKER = loaded_data["message_tracker"]
+        EXTRACTION_STATS = loaded_data["extraction_stats"]
+        
+        print("✅ Toutes les données restaurées depuis la sauvegarde !")
+        print(f"📋 Avertissements: {len(WARNINGS)} utilisateurs")
+        print(f"🎵 Files d'attente: {len(SONG_QUEUES)} serveurs")
+        print(f"🎧 Support actif: {len(SUPPORT_CHANNELS)} serveurs")
+        print(f"🎤 Salons temporaires: {len(TEMP_VOCAL_CONFIG)} serveurs")
+        
+    except Exception as e:
+        print(f"⚠️ Erreur lors du rechargement des données: {e}")
+        print("🔄 Utilisation des valeurs par défaut")
+    
     try:
         # Sync global
         print("🌍 Synchronisation globale...")
@@ -1138,6 +1174,11 @@ async def play(interaction: discord.Interaction, song: str):
     else:
         # Ajouter à la queue
         SONG_QUEUES[guild_id].append((song, "youtube"))
+        
+        # 💾 SAUVEGARDE AUTOMATIQUE des SONG_QUEUES
+        # Convertir deques en listes pour JSON
+        song_queues_dict = {k: list(v) for k, v in SONG_QUEUES.items()}
+        auto_save_data(song_queues=song_queues_dict)
         
         embed = create_embed("📋 Ajouté à la queue", f"**{song}**\nPosition: {len(SONG_QUEUES[guild_id])}")
         await interaction.followup.send(embed=embed)
@@ -1566,6 +1607,9 @@ async def warn_user(interaction: discord.Interaction, user: discord.Member, reas
     WARNINGS[user.id].append(warn_data)
     warn_count = len(WARNINGS[user.id])
     
+    # 💾 SAUVEGARDE AUTOMATIQUE DES WARNINGS
+    auto_save_data(warnings=WARNINGS)
+    
     embed = create_embed("⚠️ Utilisateur averti", f"**{user.display_name}** a reçu un avertissement", 0xffa726)
     embed.add_field(name="👮 Modérateur", value=interaction.user.mention, inline=True)
     embed.add_field(name="📊 Avertissements", value=f"{warn_count}/{config['max_warns']}", inline=True)
@@ -1580,6 +1624,8 @@ async def warn_user(interaction: discord.Interaction, user: discord.Member, reas
             
             # Reset les avertissements après punition
             WARNINGS[user.id] = []
+            # 💾 SAUVEGARDE AUTOMATIQUE après reset
+            auto_save_data(warnings=WARNINGS)
             
         except Exception as e:
             embed.add_field(name="❌ Erreur", value=f"Impossible d'appliquer le timeout automatique: {str(e)}", inline=False)
@@ -2000,6 +2046,8 @@ async def setup_support(interaction: discord.Interaction, enable: bool = True):
         if guild_id in SUPPORT_CHANNELS:
             del SUPPORT_CHANNELS[guild_id]
             del SUPPORT_CONFIG[guild_id]
+            # 💾 SAUVEGARDE AUTOMATIQUE après suppression
+            auto_save_data(support_channels=SUPPORT_CHANNELS, support_config=SUPPORT_CONFIG)
             embed = create_embed("⚙️ Support désactivé", "Système de support vocal désactivé")
             await interaction.followup.send(embed=embed)
             return
@@ -2064,6 +2112,9 @@ async def setup_support(interaction: discord.Interaction, enable: bool = True):
         SUPPORT_CONFIG[guild_id] = {"admin_role_id": admin_role_id, "category_id": category.id}
         SUPPORT_CHANNELS[guild_id] = {"waiting": waiting_channel.id, "active": []}
         
+        # 💾 SAUVEGARDE AUTOMATIQUE des SUPPORT_CHANNELS et SUPPORT_CONFIG
+        auto_save_data(support_channels=SUPPORT_CHANNELS, support_config=SUPPORT_CONFIG)
+        
         embed = create_embed("✅ Système de Support Configuré", "Support vocal automatique activé avec succès !")
         embed.add_field(name="⏳ Channel d'attente", value=f"{waiting_channel.mention}", inline=True)
         embed.add_field(name="🏷️ Catégorie", value=f"{category.name}", inline=True)
@@ -2100,6 +2151,8 @@ async def setup_temp_vocal(interaction: discord.Interaction, enable: bool = True
             del TEMP_VOCAL_CONFIG[guild_id]
             if guild_id in TEMP_VOCAL_CHANNELS:
                 del TEMP_VOCAL_CHANNELS[guild_id]
+            # 💾 SAUVEGARDE AUTOMATIQUE après suppression
+            auto_save_data(temp_vocal_config=TEMP_VOCAL_CONFIG, temp_vocal_channels=TEMP_VOCAL_CHANNELS)
             embed = create_embed("🎤 Salons temporaires désactivés", "Système désactivé")
             await interaction.followup.send(embed=embed)
             return
@@ -2146,6 +2199,9 @@ async def setup_temp_vocal(interaction: discord.Interaction, enable: bool = True
         
         if guild_id not in TEMP_VOCAL_CHANNELS:
             TEMP_VOCAL_CHANNELS[guild_id] = []
+        
+        # 💾 SAUVEGARDE AUTOMATIQUE des TEMP_VOCAL_CONFIG et TEMP_VOCAL_CHANNELS
+        auto_save_data(temp_vocal_config=TEMP_VOCAL_CONFIG, temp_vocal_channels=TEMP_VOCAL_CHANNELS)
         
         embed = create_embed("✅ Salons Vocaux Temporaires Configurés", "Système activé avec succès !")
         embed.add_field(name="➕ Channel de création", value=f"{create_channel.mention}", inline=True)
