@@ -1757,7 +1757,7 @@ async def view_warns(interaction: discord.Interaction, user: discord.Member):
 # CONFIGURATION DE SÉCURITÉ
 # ============================
 
-@bot.tree.command(name="config_security_new", description="🛡️ Configurer la sécurité avec sauvegarde")
+@bot.tree.command(name="config_security", description="🛡️ Configurer la sécurité avec sauvegarde")
 @app_commands.describe(
     raid_protection="Activer la protection anti-raid",
     auto_ban_bots="Bannir automatiquement les bots suspects",
@@ -1767,7 +1767,7 @@ async def view_warns(interaction: discord.Interaction, user: discord.Member):
     auto_delete_invites="Supprimer automatiquement les invitations",
     max_account_age_days="Âge minimum du compte (jours)"
 )
-async def config_security_new(
+async def config_security(
     interaction: discord.Interaction,
     raid_protection: bool = None,
     auto_ban_bots: bool = None,
