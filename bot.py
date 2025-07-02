@@ -1037,6 +1037,9 @@ async def handle_temp_vocal_join(member, create_channel):
             'created_at': datetime.now()
         })
         
+        # NOUVEAU: Sauvegarde automatique des salons vocaux temporaires
+        save_guild_data_automatically(member.guild.id)
+        
         logger.info(f"🎤 Salon vocal temporaire créé: {channel_name} pour {member.display_name}")
         
         # Démarrer la surveillance pour le nettoyage automatique
@@ -1096,6 +1099,9 @@ async def cleanup_temp_vocal_channel(channel):
                 TEMP_VOCAL_CHANNELS[guild_id] = [
                     ch for ch in temp_channels if ch['channel_id'] != channel.id
                 ]
+                
+                # NOUVEAU: Sauvegarde automatique après nettoyage
+                save_guild_data_automatically(channel.guild.id)
                 
                 logger.info(f"🗑️ Salon vocal temporaire nettoyé: {channel.name}")
             except Exception as e:
@@ -2255,6 +2261,9 @@ async def setup_support(interaction: discord.Interaction, enable: bool = True):
         
         SUPPORT_CONFIG[guild_id] = {"admin_role_id": admin_role_id, "category_id": category.id}
         SUPPORT_CHANNELS[guild_id] = {"waiting": waiting_channel.id, "active": []}
+        
+        # NOUVEAU: Sauvegarde automatique de la configuration de support
+        save_guild_data_automatically(interaction.guild.id)
         
         embed = create_embed("✅ Système de Support Configuré", "Support vocal automatique activé avec succès !")
         embed.add_field(name="⏳ Channel d'attente", value=f"{waiting_channel.mention}", inline=True)
