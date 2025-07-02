@@ -16,6 +16,7 @@ import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 import tempfile
 import urllib.parse
+from config_manager import get_guild_config, update_guild_config, get_voice_temp_settings
 
 # Configuration du logging
 logging.basicConfig(
@@ -105,10 +106,34 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ============================
 
 def get_security_config(guild_id):
-    """Récupère la configuration de sécurité d'un serveur"""
+    """Récupère la configuration de sécurité d'un serveur avec sauvegarde persistante"""
+    from config_manager import get_guild_config
+    
+    config = get_guild_config(guild_id)
+    security_config = config.get("security_settings", {})
+    
+    # Si pas de config existante, utiliser les valeurs par défaut et sauvegarder
+    if not security_config:
+        security_config = DEFAULT_SECURITY_CONFIG.copy()
+        update_guild_config(guild_id, "security_settings", security_config)
+    
+    return security_config
+
+def update_security_config(guild_id, key, value):
+    """Mettre à jour la configuration de sécurité avec sauvegarde"""
+    from config_manager import update_guild_config
+    
+    # Mettre à jour dans la mémoire
     if guild_id not in SECURITY_CONFIG:
         SECURITY_CONFIG[guild_id] = DEFAULT_SECURITY_CONFIG.copy()
-    return SECURITY_CONFIG[guild_id]
+    SECURITY_CONFIG[guild_id][key] = value
+    
+    # Sauvegarder de façon persistante
+    update_guild_config(guild_id, "security_settings", key, value)
+    
+    logger.info(f"🔒 Config sécurité sauvegardée - Guild: {guild_id}, {key}: {value}")
+    return True
+
 
 def is_admin(user):
     """Vérifier si l'utilisateur est administrateur, owner ou a le rôle spécial"""
@@ -1732,60 +1757,162 @@ async def view_warns(interaction: discord.Interaction, user: discord.Member):
 # CONFIGURATION DE SÉCURITÉ
 # ============================
 
-@bot.tree.command(name="config_security", description="🛡️ Configurer la sécurité anti-raid")
+@bot.tree.command(name="config_security_new", description="🛡️ Configurer la sécurité avec sauvegarde")
 @app_commands.describe(
-    setting="Paramètre à modifier",
-    value="Nouvelle valeur"
+    raid_protection="Activer la protection anti-raid",
+    auto_ban_bots="Bannir automatiquement les bots suspects",
+    max_mentions="Nombre maximum de mentions par message",
+    max_messages_per_minute="Messages maximum par minute par utilisateur",
+    anti_spam="Activer la détection de spam",
+    auto_delete_invites="Supprimer automatiquement les invitations",
+    max_account_age_days="Âge minimum du compte (jours)"
 )
-@app_commands.choices(setting=[
-    app_commands.Choice(name="🚨 Anti-raid activé", value="anti_raid_enabled"),
-    app_commands.Choice(name="💬 Anti-spam activé", value="anti_spam_enabled"),
-    app_commands.Choice(name="👥 Max joins/minute", value="max_joins_per_minute"),
-    app_commands.Choice(name="📝 Max messages/minute", value="max_messages_per_minute"),
-    app_commands.Choice(name="🔨 Auto-ban suspects", value="auto_ban_suspicious"),
-    app_commands.Choice(name="⚠️ Max avertissements", value="max_warns"),
-    app_commands.Choice(name="⏰ Durée timeout (min)", value="timeout_duration"),
-    app_commands.Choice(name="🗑️ Supprimer spam", value="delete_spam_messages"),
-    app_commands.Choice(name="👶 Seuil nouveau compte (jours)", value="new_account_threshold"),
-    app_commands.Choice(name="⚖️ Type de punition", value="punishment_type")
-])
-async def config_security(interaction: discord.Interaction, setting: str, value: str):
-    """Configurer la sécurité anti-raid"""
+async def config_security_new(
+    interaction: discord.Interaction,
+    raid_protection: bool = None,
+    auto_ban_bots: bool = None,
+    max_mentions: int = None,
+    max_messages_per_minute: int = None,
+    anti_spam: bool = None,
+    auto_delete_invites: bool = None,
+    max_account_age_days: int = None
+):
+    """Configurer les paramètres de sécurité avec sauvegarde persistante"""
     
     if not is_admin(interaction.user):
-        await interaction.response.send_message("❌ Vous devez être administrateur !", ephemeral=True)
+        await interaction.response.send_message("❌ Vous devez être administrateur ou avoir le rôle autorisé !", ephemeral=True)
         return
     
-    config = get_security_config(interaction.guild_id)
+    await interaction.response.defer(ephemeral=True)
     
     try:
-        if setting in ["anti_raid_enabled", "anti_spam_enabled", "auto_ban_suspicious", "delete_spam_messages"]:
-            config[setting] = value.lower() in ['true', '1', 'yes', 'oui', 'on']
+        changes = []
+        
+        # Mettre à jour chaque paramètre fourni
+        if raid_protection is not None:
+            update_security_config(interaction.guild.id, "raid_protection", raid_protection)
+            changes.append(f"**Protection anti-raid :** {'✅ Activée' if raid_protection else '❌ Désactivée'}")
+        
+        if auto_ban_bots is not None:
+            update_security_config(interaction.guild.id, "auto_ban_bots", auto_ban_bots)
+            changes.append(f"**Auto-ban bots :** {'✅ Activé' if auto_ban_bots else '❌ Désactivé'}")
+        
+        if max_mentions is not None:
+            max_mentions = max(1, min(max_mentions, 20))
+            update_security_config(interaction.guild.id, "max_mentions", max_mentions)
+            changes.append(f"**Max mentions :** {max_mentions}")
+        
+        if max_messages_per_minute is not None:
+            max_messages_per_minute = max(1, min(max_messages_per_minute, 60))
+            update_security_config(interaction.guild.id, "max_messages_per_minute", max_messages_per_minute)
+            changes.append(f"**Max messages/min :** {max_messages_per_minute}")
+        
+        if anti_spam is not None:
+            update_security_config(interaction.guild.id, "anti_spam", anti_spam)
+            changes.append(f"**Anti-spam :** {'✅ Activé' if anti_spam else '❌ Désactivé'}")
+        
+        if auto_delete_invites is not None:
+            update_security_config(interaction.guild.id, "auto_delete_invites", auto_delete_invites)
+            changes.append(f"**Auto-delete invites :** {'✅ Activé' if auto_delete_invites else '❌ Désactivé'}")
+        
+        if max_account_age_days is not None:
+            max_account_age_days = max(0, min(max_account_age_days, 365))
+            update_security_config(interaction.guild.id, "max_account_age_days", max_account_age_days)
+            changes.append(f"**Âge minimum compte :** {max_account_age_days} jours")
+        
+        if not changes:
+            # Afficher la configuration actuelle
+            current_config = get_security_config(interaction.guild.id)
+            embed = create_embed("🛡️ Configuration Sécurité", "Configuration actuelle sauvegardée :", 0xff6b6b)
             
-        elif setting in ["max_joins_per_minute", "max_messages_per_minute", "max_warns", "new_account_threshold"]:
-            config[setting] = max(1, int(value))
+            config_text = f"**Protection anti-raid :** {'✅' if current_config.get('raid_protection') else '❌'}\n"
+            config_text += f"**Auto-ban bots :** {'✅' if current_config.get('auto_ban_bots') else '❌'}\n"
+            config_text += f"**Max mentions :** {current_config.get('max_mentions', 5)}\n"
+            config_text += f"**Max messages/min :** {current_config.get('max_messages_per_minute', 10)}\n"
+            config_text += f"**Anti-spam :** {'✅' if current_config.get('anti_spam') else '❌'}\n"
+            config_text += f"**Auto-delete invites :** {'✅' if current_config.get('auto_delete_invites') else '❌'}\n"
+            config_text += f"**Âge minimum compte :** {current_config.get('max_account_age_days', 7)} jours"
             
-        elif setting == "timeout_duration":
-            config[setting] = max(60, min(86400, int(value) * 60))  # Convert minutes to seconds
+            embed.description = config_text
+            embed.add_field(name="💾 Sauvegarde", value="✅ Tous les paramètres sont sauvegardés de façon persistante", inline=False)
             
-        elif setting == "punishment_type":
-            if value.lower() in ["timeout", "kick", "ban"]:
-                config[setting] = value.lower()
-            else:
-                await interaction.response.send_message("❌ Type de punition invalide ! Utilisez: timeout, kick, ou ban", ephemeral=True)
-                return
+        else:
+            # Afficher les modifications
+            embed = create_embed("✅ Configuration Sécurité Sauvegardée", "Paramètres mis à jour et sauvegardés :", 0x66bb6a)
+            embed.description = "\n".join(changes)
+            embed.add_field(name="💾 Sauvegarde", value="✅ Configuration sauvegardée automatiquement dans bot_configs.json", inline=False)
         
-        embed = create_embed("✅ Configuration mise à jour", f"**{setting}** = `{value}`", 0x66bb6a)
-        embed.add_field(name="👮 Modérateur", value=interaction.user.mention, inline=True)
+        embed.set_footer(text=f"Configuré par {interaction.user.display_name} • Sauvegarde persistante activée")
+        await interaction.followup.send(embed=embed, ephemeral=True)
         
-        await interaction.response.send_message(embed=embed)
+        # Log l'action
+        if changes:
+            await log_action(interaction.guild, "config", interaction.user, interaction.guild.me, f"Configuration sécurité mise à jour et sauvegardée ({len(changes)} paramètres)")
+            logger.info(f"🛡️ {interaction.user} a mis à jour la config sécurité: {len(changes)} paramètres - SAUVEGARDÉ")
         
-        logger.info(f"⚙️ {interaction.user} a modifié {setting} = {value} sur {interaction.guild.name}")
-        
-    except ValueError:
-        await interaction.response.send_message("❌ Valeur invalide ! Vérifiez le type de données requis.", ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f"❌ Erreur: {str(e)}", ephemeral=True)
+        embed = create_embed("❌ Erreur", f"Impossible de mettre à jour la configuration: {str(e)}", 0xff0000)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        logger.error(f"❌ Erreur config security: {e}")
+
+@bot.tree.command(name="show_config_complete", description="📊 Afficher toute la configuration sauvegardée")
+async def show_config_complete(interaction: discord.Interaction):
+    """Afficher toutes les configurations sauvegardées du serveur"""
+    
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("❌ Vous devez être administrateur ou avoir le rôle autorisé !", ephemeral=True)
+        return
+    
+    try:
+        from config_manager import get_guild_config
+        
+        config = get_guild_config(interaction.guild.id)
+        
+        embed = create_embed("📊 Configuration Complète Sauvegardée", f"Configuration persistante pour **{interaction.guild.name}**", 0x5865f2)
+        
+        # 🛡️ SÉCURITÉ
+        security_config = config.get("security_settings", {})
+        security_info = f"**Protection anti-raid :** {'✅' if security_config.get('raid_protection') else '❌'}\n"
+        security_info += f"**Auto-ban bots :** {'✅' if security_config.get('auto_ban_bots') else '❌'}\n"
+        security_info += f"**Anti-spam :** {'✅' if security_config.get('anti_spam') else '❌'}\n"
+        security_info += f"**Max mentions :** {security_config.get('max_mentions', 5)}\n"
+        security_info += f"**Max msg/min :** {security_config.get('max_messages_per_minute', 10)}\n"
+        security_info += f"**Auto-delete invites :** {'✅' if security_config.get('auto_delete_invites') else '❌'}\n"
+        security_info += f"**Âge min compte :** {security_config.get('max_account_age_days', 7)} jours"
+        
+        embed.add_field(name="🛡️ Sécurité (Sauvegardée)", value=security_info, inline=False)
+        
+        # 🎤 SALON VOCAL TEMPORAIRE
+        voice_settings = config.get("voice_temp_settings", {})
+        category_name = "Non définie"
+        if voice_settings.get("category_id"):
+            cat = interaction.guild.get_channel(voice_settings["category_id"])
+            category_name = cat.name if cat else "Catégorie supprimée"
+        
+        voice_info = f"**Catégorie :** {category_name}\n"
+        voice_info += f"**Nom :** {voice_settings.get('temp_channel_name', 'Non défini')}\n"
+        voice_info += f"**Limite :** {voice_settings.get('user_limit', 0) or 'Illimité'}\n"
+        voice_info += f"**Auto-delete :** {'✅' if voice_settings.get('auto_delete', True) else '❌'}"
+        
+        embed.add_field(name="🎤 Salon Vocal Temp (Sauvegardé)", value=voice_info, inline=True)
+        
+        # 🤖 PARAMÈTRES BOT
+        bot_settings = config.get("bot_settings", {})
+        bot_info = f"**Prefix :** {bot_settings.get('prefix', '/')}\n"
+        bot_info += f"**Log actions :** {'✅' if bot_settings.get('log_actions', True) else '❌'}\n"
+        bot_info += f"**Message bienvenue :** {'✅' if bot_settings.get('welcome_message', True) else '❌'}"
+        
+        embed.add_field(name="🤖 Bot (Sauvegardé)", value=bot_info, inline=True)
+        
+        embed.add_field(name="💾 Sauvegarde Persistante", value="✅ **TOUTES les configurations sont automatiquement sauvegardées**\n📁 Fichier: `bot_configs.json`\n🔄 Rechargement automatique au redémarrage", inline=False)
+        
+        embed.set_footer(text=f"📁 Sauvegarde automatique • {datetime.now().strftime('%d/%m/%Y %H:%M')} • Plus jamais de perte de config !")
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Erreur lors de la récupération de la config: {str(e)}", ephemeral=True)
+        logger.error(f"❌ Erreur show_config_complete: {e}")
 
 @bot.tree.command(name="security_status", description="📊 Voir l'état de la sécurité")
 async def security_status(interaction: discord.Interaction):
