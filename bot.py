@@ -76,7 +76,7 @@ MESSAGE_TRACKER = defaultdict(list)
 DEFAULT_SECURITY_CONFIG = {
     "enabled": True,
     "max_joins_per_minute": 5,
-    "max_messages_per_minute": 10,
+    "max_messages_per_minute": 35,
     "auto_ban_suspicious": True,
     "log_channel_id": None,
     "whitelist": [],
@@ -110,9 +110,26 @@ def get_security_config(guild_id):
         SECURITY_CONFIG[guild_id] = DEFAULT_SECURITY_CONFIG.copy()
     return SECURITY_CONFIG[guild_id]
 
-def is_admin(member):
-    """Vérifie si un membre est administrateur"""
-    return member.guild_permissions.administrator
+def is_admin(user):
+    """Vérifier si l'utilisateur est administrateur, owner ou a le rôle spécial"""
+
+    
+    # ID du rôle autorisé
+    AUTHORIZED_ROLE_ID = 1389720677698768968
+    
+    # Vérifier si c'est le propriétaire du bot (PRIORITÉ ABSOLUE)
+    if user.id == OWNER_ID:
+        return True
+    
+    # Vérifier les permissions administrateur classiques
+    if user.guild_permissions.administrator:
+        return True
+    
+    # Vérifier si l'utilisateur a le rôle spécifique
+    if any(role.id == AUTHORIZED_ROLE_ID for role in user.roles):
+        return True
+    
+    return False
 
 def is_suspicious_account(member):
     """Détecte si un compte est suspect"""
