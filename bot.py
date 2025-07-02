@@ -18,6 +18,36 @@ import tempfile
 import urllib.parse
 from config_manager import get_guild_config, update_guild_config, get_voice_temp_settings
 
+# ============================
+# TÂCHE DE SAUVEGARDE PÉRIODIQUE
+# ============================
+
+async def periodic_backup_task():
+    """Tâche de sauvegarde automatique périodique (toutes les 30 minutes)"""
+    await bot.wait_until_ready()
+    
+    while not bot.is_closed():
+        try:
+            # Attendre 30 minutes
+            await asyncio.sleep(1800)  # 30 minutes en secondes
+            
+            logger.info("🔄 Lancement de la sauvegarde périodique...")
+            
+            from config_manager import auto_backup
+            success = auto_backup()
+            
+            if success:
+                logger.info("✅ Sauvegarde périodique terminée avec succès")
+            else:
+                logger.warning("⚠️ Échec de la sauvegarde périodique")
+                
+        except asyncio.CancelledError:
+            logger.info("🛑 Tâche de sauvegarde périodique arrêtée")
+            break
+        except Exception as e:
+            logger.error(f"❌ Erreur dans la tâche de sauvegarde périodique: {e}")
+            # Continuer la boucle même en cas d'erreur
+
 # Configuration du logging
 logging.basicConfig(
     level=logging.INFO,
@@ -73,21 +103,21 @@ RAID_PROTECTION = {}
 JOIN_TRACKER = defaultdict(list)
 MESSAGE_TRACKER = defaultdict(list)
 
-# Configuration par défaut pour la sécurité
+# Configuration par défaut pour la sécurité (DÉSACTIVÉE par défaut)
 DEFAULT_SECURITY_CONFIG = {
-    "enabled": True,
+    "enabled": False,
     "max_joins_per_minute": 5,
     "max_messages_per_minute": 35,
-    "auto_ban_suspicious": True,
+    "auto_ban_suspicious": False,
     "log_channel_id": None,
     "whitelist": [],
     "blacklist": [],
     "raid_mode": False,
     "max_warns": 3,
     "timeout_duration": 300,  # 5 minutes
-    "delete_spam_messages": True,
-    "anti_spam_enabled": True,
-    "anti_raid_enabled": True,
+    "delete_spam_messages": False,
+    "anti_spam_enabled": False,
+    "anti_raid_enabled": False,
     "new_account_threshold": 7,  # jours
     "punishment_type": "timeout"  # timeout, kick, ban
 }
@@ -100,6 +130,126 @@ intents.members = True
 intents.moderation = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ============================
+# FONCTIONS DE SAUVEGARDE ET CHARGEMENT
+# ============================
+
+def load_all_persistent_data():
+    """Charger toutes les données persistantes au démarrage"""
+    global WARNINGS, SONG_QUEUES, LOOP_MODES, CURRENT_SONGS
+    global SUPPORT_CHANNELS, SUPPORT_CONFIG, TEMP_VOCAL_CONFIG, TEMP_VOCAL_CHANNELS
+    global SECURITY_CONFIG, RAID_PROTECTION, JOIN_TRACKER, MESSAGE_TRACKER
+    
+    try:
+        from config_manager import load_config, load_all_guild_data
+        
+        logger.info("🔄 Chargement des données persistantes...")
+        
+        # Charger la configuration globale
+        config = load_config()
+        
+        # Restaurer les données pour chaque serveur
+        for guild_str, guild_data in config.items():
+            try:
+                guild_id = int(guild_str)
+                
+                # Charger toutes les données du serveur
+                data = load_all_guild_data(guild_id)
+                
+                # Restaurer les avertissements
+                if data.get("warnings"):
+                    for user_id_str, user_warnings in data["warnings"].items():
+                        user_id = int(user_id_str)
+                        WARNINGS[user_id] = user_warnings
+                
+                # Restaurer les queues (conversion en deque et listes en tuples)
+                if data.get("song_queues"):
+                    # Convertir les listes JSON de retour en tuples
+                    queue_items = []
+                    for item in data["song_queues"]:
+                        if isinstance(item, list) and len(item) == 2:
+                            queue_items.append(tuple(item))
+                        else:
+                            queue_items.append(item)
+                    SONG_QUEUES[str(guild_id)] = deque(queue_items)
+                
+                # Restaurer les autres données
+                if data.get("loop_modes"):
+                    LOOP_MODES[str(guild_id)] = data["loop_modes"]
+                
+                if data.get("current_songs"):
+                    CURRENT_SONGS[str(guild_id)] = data["current_songs"]
+                
+                if data.get("support_channels"):
+                    SUPPORT_CHANNELS[guild_id] = data["support_channels"]
+                
+                if data.get("temp_vocal_channels"):
+                    TEMP_VOCAL_CHANNELS[guild_id] = data["temp_vocal_channels"]
+                
+                if data.get("raid_protection"):
+                    RAID_PROTECTION[guild_id] = data["raid_protection"]
+                
+                if data.get("join_tracker"):
+                    JOIN_TRACKER[guild_id] = data["join_tracker"]
+                
+                if data.get("message_tracker"):
+                    MESSAGE_TRACKER[guild_id] = data["message_tracker"]
+                
+                logger.info(f"✅ Données restaurées pour le serveur {guild_id}")
+                
+            except ValueError:
+                # guild_str n'est pas un ID valide, ignorer
+                continue
+            except Exception as e:
+                logger.warning(f"⚠️ Erreur lors de la restauration pour le serveur {guild_str}: {e}")
+        
+        logger.info("🎉 Toutes les données persistantes ont été chargées avec succès")
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur lors du chargement des données persistantes: {e}")
+
+def save_guild_data_automatically(guild_id):
+    """Sauvegarder automatiquement toutes les données d'un serveur"""
+    try:
+        from config_manager import save_all_guild_data
+        
+        # Convertir les deque en listes pour la sérialisation JSON
+        guild_str = str(guild_id)
+        queues_data = []
+        if guild_str in SONG_QUEUES:
+            # Convertir deque en liste, et tuples en listes pour JSON
+            queues_data = [list(item) if isinstance(item, tuple) else item for item in SONG_QUEUES[guild_str]]
+        
+        # Préparer les données des avertissements (convertir les clés int en str)
+        warnings_data = {}
+        for user_id, user_warnings in WARNINGS.items():
+            if any(warn.get("guild_id") == guild_id for warn in user_warnings):
+                warnings_data[str(user_id)] = user_warnings
+        
+        # Préparer les données de support
+        support_data = SUPPORT_CHANNELS.get(guild_id, {"active": [], "config": {}})
+        
+        # Préparer les données des salons vocaux temporaires
+        temp_channels_data = TEMP_VOCAL_CHANNELS.get(guild_id, [])
+        
+        # Sauvegarder toutes les données
+        success = save_all_guild_data(
+            guild_id, 
+            warnings=warnings_data,
+            queues=queues_data,
+            support=support_data,
+            temp_channels=temp_channels_data
+        )
+        
+        if success:
+            logger.debug(f"💾 Sauvegarde automatique réussie pour le serveur {guild_id}")
+        
+        return success
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur lors de la sauvegarde automatique pour le serveur {guild_id}: {e}")
+        return False
 
 # ============================
 # FONCTIONS UTILITAIRES DE SÉCURITÉ
@@ -674,6 +824,9 @@ async def play_next_in_queue(voice_client, channel):
         # Récupérer la prochaine chanson
         query, source_type = SONG_QUEUES[guild_id].popleft()
         
+        # NOUVEAU: Sauvegarde automatique après retrait de la queue
+        save_guild_data_automatically(voice_client.guild.id)
+        
         # Message de progression
         embed = create_embed("🔍 Extraction suivante...", f"Recherche: `{query}`", 0xffff00)
         progress_msg = await channel.send(embed=embed)
@@ -977,6 +1130,11 @@ async def on_ready():
     print(f"🤖 {bot.user} est connecté et prêt !")
     print(f"🏠 Serveurs: {len(bot.guilds)}")
     
+    # NOUVEAU: Charger toutes les données persistantes
+    print("💾 Chargement des données persistantes...")
+    load_all_persistent_data()
+    print("✅ Données persistantes chargées !")
+    
     try:
         # Sync global
         print("🌍 Synchronisation globale...")
@@ -1000,6 +1158,23 @@ async def on_ready():
     # Initialiser Spotify
     init_spotify()
     
+    # NOUVEAU: Créer une sauvegarde automatique au démarrage
+    try:
+        from config_manager import auto_backup
+        print("💾 Création de la sauvegarde automatique de démarrage...")
+        auto_backup()
+        print("✅ Sauvegarde automatique créée !")
+    except Exception as e:
+        print(f"⚠️ Erreur lors de la sauvegarde automatique: {e}")
+    
+    # NOUVEAU: Démarrer la tâche de sauvegarde périodique
+    try:
+        print("⏰ Démarrage de la sauvegarde périodique (toutes les 30 min)...")
+        bot.loop.create_task(periodic_backup_task())
+        print("✅ Sauvegarde périodique activée !")
+    except Exception as e:
+        print(f"⚠️ Erreur lors du démarrage de la sauvegarde périodique: {e}")
+    
     # Vérifier yt-dlp
     try:
         process = await asyncio.create_subprocess_exec(
@@ -1019,9 +1194,11 @@ async def on_ready():
     )
     
     print("=" * 80)
-    print(f"🎵 BOT COMPLET AVEC MODÉRATION ET ANTI-RAID PRÊT !")
+    print(f"🎵 BOT COMPLET AVEC SAUVEGARDE AUTOMATIQUE PRÊT !")
     print(f"👤 Connecté: {bot.user.name}")
     print(f"🏠 Serveurs: {len(bot.guilds)}")
+    print(f"💾 Sauvegarde: ✅ Auto-persistance complète activée")
+    print(f"🛡️ Sécurité: ❌ Désactivée par défaut (mode raid manuel)")
     print(f"🎧 Spotify API: {'✅ Configurée' if spotify_client else '⚠️ Non configurée'}")
     print(f"🔥 yt-dlp: ✅ 8 méthodes d'extraction robustes")
     print(f"🎯 Sources: YouTube direct + SoundCloud + Spotify→YouTube")
@@ -1139,6 +1316,9 @@ async def play(interaction: discord.Interaction, song: str):
         # Ajouter à la queue
         SONG_QUEUES[guild_id].append((song, "youtube"))
         
+        # NOUVEAU: Sauvegarde automatique de la queue
+        save_guild_data_automatically(interaction.guild.id)
+        
         embed = create_embed("📋 Ajouté à la queue", f"**{song}**\nPosition: {len(SONG_QUEUES[guild_id])}")
         await interaction.followup.send(embed=embed)
 
@@ -1220,6 +1400,9 @@ async def spotify_play(interaction: discord.Interaction, song: str):
         # Ajouter à la queue
         SONG_QUEUES[guild_id].append((search_query, "youtube"))
         
+        # NOUVEAU: Sauvegarde automatique de la queue
+        save_guild_data_automatically(interaction.guild.id)
+        
         embed = create_embed("📋 Spotify ajouté", f"**{search_query}**\nPosition: {len(SONG_QUEUES[guild_id])}")
         await interaction.followup.send(embed=embed)
 
@@ -1278,6 +1461,9 @@ async def soundcloud_play(interaction: discord.Interaction, song: str):
     else:
         # Ajouter à la queue
         SONG_QUEUES[guild_id].append((song, "soundcloud"))
+        
+        # NOUVEAU: Sauvegarde automatique de la queue
+        save_guild_data_automatically(interaction.guild.id)
         
         embed = create_embed("📋 SoundCloud ajouté", f"**{song}**\nPosition: {len(SONG_QUEUES[guild_id])}")
         await interaction.followup.send(embed=embed)
@@ -1566,6 +1752,9 @@ async def warn_user(interaction: discord.Interaction, user: discord.Member, reas
     WARNINGS[user.id].append(warn_data)
     warn_count = len(WARNINGS[user.id])
     
+    # NOUVEAU: Sauvegarde automatique des avertissements
+    save_guild_data_automatically(interaction.guild.id)
+    
     embed = create_embed("⚠️ Utilisateur averti", f"**{user.display_name}** a reçu un avertissement", 0xffa726)
     embed.add_field(name="👮 Modérateur", value=interaction.user.mention, inline=True)
     embed.add_field(name="📊 Avertissements", value=f"{warn_count}/{config['max_warns']}", inline=True)
@@ -1580,6 +1769,9 @@ async def warn_user(interaction: discord.Interaction, user: discord.Member, reas
             
             # Reset les avertissements après punition
             WARNINGS[user.id] = []
+            
+            # NOUVEAU: Sauvegarde automatique après reset
+            save_guild_data_automatically(interaction.guild.id)
             
         except Exception as e:
             embed.add_field(name="❌ Erreur", value=f"Impossible d'appliquer le timeout automatique: {str(e)}", inline=False)

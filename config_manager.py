@@ -62,7 +62,7 @@ def get_guild_config(guild_id: int) -> Dict[str, Any]:
     return config[guild_str]
 
 def create_default_guild_config() -> Dict[str, Any]:
-    """Créer une configuration par défaut pour un serveur"""
+    """Créer une configuration par défaut pour un serveur avec TOUS les paramètres"""
     return {
         "security_settings": {},
         "voice_temp_settings": {
@@ -76,7 +76,19 @@ def create_default_guild_config() -> Dict[str, Any]:
             "log_actions": True,
             "welcome_message": True,
             "welcome_channel_id": None
-        }
+        },
+        "warnings": {},  # {user_id: [warning_data, ...]}
+        "song_queues": [],  # Queue des chansons
+        "loop_modes": {},  # Mode loop par serveur
+        "current_songs": {},  # Chanson actuelle
+        "support_channels": {
+            "active": [],
+            "config": {}
+        },
+        "temp_vocal_channels": [],  # Salons vocaux temporaires actifs
+        "raid_protection": {},  # Données de protection anti-raid
+        "join_tracker": [],  # Suivi des connexions
+        "message_tracker": []  # Suivi des messages
     }
 
 def update_guild_config(guild_id: int, section: str, key_or_data: Any, value: Any = None) -> bool:
@@ -111,6 +123,10 @@ def update_guild_config(guild_id: int, section: str, key_or_data: Any, value: An
             if isinstance(key_or_data, dict):
                 config[guild_str][section].update(key_or_data)
                 logger.info(f"🔧 Config mise à jour - Guild: {guild_id}, Section: {section}, Données: {key_or_data}")
+            elif isinstance(key_or_data, (list, str, int, float, bool)) or key_or_data is None:
+                # Remplacer complètement la section avec les nouvelles données
+                config[guild_str][section] = key_or_data
+                logger.info(f"🔧 Config remplacée - Guild: {guild_id}, Section: {section}, Nouvelles données: {key_or_data}")
             else:
                 logger.error(f"❌ Type de données incorrect pour la mise à jour: {type(key_or_data)}")
                 return False
@@ -151,6 +167,71 @@ def get_security_settings(guild_id: int) -> Dict[str, Any]:
     """Récupérer les paramètres de sécurité"""
     guild_config = get_guild_config(guild_id)
     return guild_config.get("security_settings", {})
+
+def get_warnings(guild_id: int) -> Dict[str, list]:
+    """Récupérer les avertissements sauvegardés"""
+    guild_config = get_guild_config(guild_id)
+    return guild_config.get("warnings", {})
+
+def save_warnings(guild_id: int, warnings_data: Dict[str, list]) -> bool:
+    """Sauvegarder les avertissements"""
+    return update_guild_config(guild_id, "warnings", warnings_data)
+
+def get_song_queue(guild_id: int) -> list:
+    """Récupérer la queue des chansons"""
+    guild_config = get_guild_config(guild_id)
+    return guild_config.get("song_queues", [])
+
+def save_song_queue(guild_id: int, queue_data: list) -> bool:
+    """Sauvegarder la queue des chansons"""
+    return update_guild_config(guild_id, "song_queues", queue_data)
+
+def get_support_channels(guild_id: int) -> Dict[str, Any]:
+    """Récupérer les données des salons de support"""
+    guild_config = get_guild_config(guild_id)
+    return guild_config.get("support_channels", {"active": [], "config": {}})
+
+def save_support_channels(guild_id: int, support_data: Dict[str, Any]) -> bool:
+    """Sauvegarder les données des salons de support"""
+    return update_guild_config(guild_id, "support_channels", support_data)
+
+def get_temp_vocal_channels(guild_id: int) -> list:
+    """Récupérer les salons vocaux temporaires"""
+    guild_config = get_guild_config(guild_id)
+    return guild_config.get("temp_vocal_channels", [])
+
+def save_temp_vocal_channels(guild_id: int, channels_data: list) -> bool:
+    """Sauvegarder les salons vocaux temporaires"""
+    return update_guild_config(guild_id, "temp_vocal_channels", channels_data)
+
+def save_all_guild_data(guild_id: int, warnings: dict = None, queues: list = None, 
+                       support: dict = None, temp_channels: list = None) -> bool:
+    """Sauvegarder toutes les données d'un serveur en une fois"""
+    try:
+        config = load_config()
+        guild_str = str(guild_id)
+        
+        if guild_str not in config:
+            config[guild_str] = create_default_guild_config()
+        
+        # Mettre à jour toutes les données fournies
+        if warnings is not None:
+            config[guild_str]["warnings"] = warnings
+        if queues is not None:
+            config[guild_str]["song_queues"] = queues
+        if support is not None:
+            config[guild_str]["support_channels"] = support
+        if temp_channels is not None:
+            config[guild_str]["temp_vocal_channels"] = temp_channels
+        
+        success = save_config(config)
+        if success:
+            logger.info(f"🔄 Sauvegarde complète effectuée pour le serveur {guild_id}")
+        return success
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur lors de la sauvegarde complète: {e}")
+        return False
 
 def delete_guild_config(guild_id: int) -> bool:
     """Supprimer la configuration d'un serveur"""
@@ -216,6 +297,72 @@ def restore_config(backup_file: str) -> bool:
     except Exception as e:
         logger.error(f"❌ Erreur lors de la restauration: {e}")
         return False
+
+def auto_backup() -> bool:
+    """Créer une sauvegarde automatique avec horodatage"""
+    try:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_file = f"bot_configs_auto_backup_{timestamp}.json"
+        
+        success = backup_config(backup_file)
+        if success:
+            logger.info(f"🔄 Sauvegarde automatique créée: {backup_file}")
+            
+            # Nettoyer les anciennes sauvegardes (garder seulement les 10 dernières)
+            cleanup_old_backups()
+        
+        return success
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur lors de la sauvegarde automatique: {e}")
+        return False
+
+def cleanup_old_backups(max_backups: int = 10):
+    """Nettoyer les anciennes sauvegardes automatiques"""
+    try:
+        import glob
+        
+        # Chercher tous les fichiers de sauvegarde automatique
+        backup_pattern = "bot_configs_auto_backup_*.json"
+        backup_files = glob.glob(backup_pattern)
+        
+        if len(backup_files) > max_backups:
+            # Trier par date de modification
+            backup_files.sort(key=os.path.getmtime)
+            
+            # Supprimer les plus anciens
+            files_to_delete = backup_files[:-max_backups]
+            for file_path in files_to_delete:
+                try:
+                    os.remove(file_path)
+                    logger.info(f"🗑️ Ancienne sauvegarde supprimée: {file_path}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Impossible de supprimer {file_path}: {e}")
+                    
+    except Exception as e:
+        logger.error(f"❌ Erreur lors du nettoyage des sauvegardes: {e}")
+
+def load_all_guild_data(guild_id: int) -> Dict[str, Any]:
+    """Charger toutes les données d'un serveur"""
+    try:
+        guild_config = get_guild_config(guild_id)
+        
+        return {
+            "warnings": guild_config.get("warnings", {}),
+            "song_queues": guild_config.get("song_queues", []),
+            "loop_modes": guild_config.get("loop_modes", {}),
+            "current_songs": guild_config.get("current_songs", {}),
+            "support_channels": guild_config.get("support_channels", {"active": [], "config": {}}),
+            "temp_vocal_channels": guild_config.get("temp_vocal_channels", []),
+            "raid_protection": guild_config.get("raid_protection", {}),
+            "join_tracker": guild_config.get("join_tracker", []),
+            "message_tracker": guild_config.get("message_tracker", [])
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur lors du chargement des données pour le serveur {guild_id}: {e}")
+        return {}
 
 # Initialisation du module
 logger.info("🔧 Module config_manager initialisé")
